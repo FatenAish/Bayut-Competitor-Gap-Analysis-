@@ -2884,7 +2884,13 @@ def serpapi_serp_cached(query: str, device: str) -> dict:
     except Exception as e:
         return {"_error": str(e)}
 
-def build_ai_visibility_table(query: str, target_url: str, competitors: List[str], device: str = "mobile") -> pd.DataFrame:
+def build_ai_visibility_table(
+    query: str,
+    target_url: str,
+    competitors: List[str],
+    device: str = "mobile",
+    list_limit: int = 6,
+) -> pd.DataFrame:
     cols = ["Target URL Cited in AIO","Cited Domains","# AIO Citations","Top Competitor Domains","SERP Features Present","People Also Ask questions"]
     if not query:
         return pd.DataFrame([{c: "Not available" for c in cols}], columns=cols)
@@ -2913,7 +2919,7 @@ def build_ai_visibility_table(query: str, target_url: str, competitors: List[str
                 target_cited = "Not applicable"
             else:
                 target_cited = "Yes" if target_dom in cited_domains else "No"
-            cited_domains_txt = format_gap_list(cited_domains, limit=6) if cited_domains else "None detected"
+            cited_domains_txt = format_gap_list(cited_domains, limit=list_limit) if cited_domains else "None detected"
             cited_count = str(len(cited_urls))
 
         top_comp_domains = []
@@ -2932,16 +2938,16 @@ def build_ai_visibility_table(query: str, target_url: str, competitors: List[str
                 break
 
         serp_features = _dataforseo_features_present(data)
-        serp_features_txt = format_gap_list(serp_features, limit=6) if serp_features else "None detected"
+        serp_features_txt = format_gap_list(serp_features, limit=list_limit) if serp_features else "None detected"
         paa_questions = _dataforseo_paa_questions(data)
-        paa_txt = format_gap_list(paa_questions, limit=6) if paa_questions else "None detected"
+        paa_txt = format_gap_list(paa_questions, limit=list_limit) if paa_questions else "None detected"
         tips = _aio_tip_items(target_cited, serp_features, paa_questions, cited_domains, top_comp_domains)
 
         row = {
             "Target URL Cited in AIO": _aio_tip_cell(target_cited, tips),
             "Cited Domains": cited_domains_txt or "Not available",
             "# AIO Citations": cited_count,
-            "Top Competitor Domains": format_gap_list(top_comp_domains, limit=6) if top_comp_domains else "Not available",
+            "Top Competitor Domains": format_gap_list(top_comp_domains, limit=list_limit) if top_comp_domains else "Not available",
             "SERP Features Present": serp_features_txt,
             "People Also Ask questions": paa_txt,
         }
@@ -2973,7 +2979,7 @@ def build_ai_visibility_table(query: str, target_url: str, competitors: List[str
             target_cited = "Not applicable"
         else:
             target_cited = "Yes" if target_dom in cited_domains else "No"
-        cited_domains_txt = format_gap_list(cited_domains, limit=6) if cited_domains else "None detected"
+        cited_domains_txt = format_gap_list(cited_domains, limit=list_limit) if cited_domains else "None detected"
         cited_count = str(len(cited_urls))
 
     top_comp_domains = []
@@ -2991,16 +2997,16 @@ def build_ai_visibility_table(query: str, target_url: str, competitors: List[str
             break
 
     serp_features = _serp_features_present(data)
-    serp_features_txt = format_gap_list(serp_features, limit=6) if serp_features else "None detected"
+    serp_features_txt = format_gap_list(serp_features, limit=list_limit) if serp_features else "None detected"
     paa_questions = _serpapi_paa_questions(data)
-    paa_txt = format_gap_list(paa_questions, limit=6) if paa_questions else "None detected"
+    paa_txt = format_gap_list(paa_questions, limit=list_limit) if paa_questions else "None detected"
     tips = _aio_tip_items(target_cited, serp_features, paa_questions, cited_domains, top_comp_domains)
 
     row = {
         "Target URL Cited in AIO": _aio_tip_cell(target_cited, tips),
         "Cited Domains": cited_domains_txt or "Not available",
         "# AIO Citations": cited_count,
-        "Top Competitor Domains": format_gap_list(top_comp_domains, limit=6) if top_comp_domains else "Not available",
+        "Top Competitor Domains": format_gap_list(top_comp_domains, limit=list_limit) if top_comp_domains else "Not available",
         "SERP Features Present": serp_features_txt,
         "People Also Ask questions": paa_txt,
     }
@@ -3258,14 +3264,6 @@ def _latest_year_mentioned(text: str) -> int:
         except Exception:
             pass
     return max(ys) if ys else 0
-
-def _has_brief_summary(nodes: List[dict], text: str) -> str:
-    blob = (headings_blob(nodes) or "").lower()
-    t = (text or "").lower()
-    cues = ["tl;dr", "tldr", "key takeaways", "in summary", "summary", "quick summary", "at a glance"]
-    if any(c in blob for c in cues) or any(c in t[:1400] for c in cues):
-        return "Yes"
-    return "No"
 
 def _count_source_links(html: str) -> int:
     if not html:
@@ -3945,7 +3943,7 @@ def build_content_quality_table_from_seo(
 
     cols = [
         "Page","Last Updated / Modified","Topic Cannibalization","Keyword Stuffing",
-        "Brief Summary","FAQs","References Section",
+        "FAQs","References Section",
         "Internal linking","Misspelling & Wrong Words","Latest Information Score",
         "Outdated / Misleading Info","Styling / Layout",
     ]
@@ -4014,7 +4012,6 @@ def build_content_quality_table_from_seo(
                 kw_stuff_secondary = "Not available"
             kw_stuff = f"Primary: {kw_stuff} | Secondary: {kw_stuff_secondary}"
 
-        brief = _has_brief_summary(nodes, text)
         faqs = "Yes" if (fr and page_has_real_faq(fr, nodes)) else "No"
         refs = _references_section_present(nodes, html)
         internal_quality = _internal_linking_quality(html, page_url, wc_body)
@@ -4028,7 +4025,6 @@ def build_content_quality_table_from_seo(
             "Last Updated / Modified": lm,
             "Topic Cannibalization": topic_cann,
             "Keyword Stuffing": kw_stuff,
-            "Brief Summary": brief,
             "FAQs": faqs,
             "References Section": refs,
             "Internal linking": internal_quality,
@@ -4093,6 +4089,11 @@ def new_post_coverage_rows(comp_nodes: List[dict], comp_url: str) -> List[dict]:
 # =====================================================
 # HTML TABLE RENDER (UPDATED: use data-table class)
 # =====================================================
+def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df is None or df.empty:
+        return b""
+    return df.to_csv(index=False).encode("utf-8")
+
 def render_table(df: pd.DataFrame, drop_internal_url: bool = True):
     if df is None or df.empty:
         st.info("No results to show.")
@@ -4248,12 +4249,14 @@ for k, default in [
     ("ai_update_df", pd.DataFrame()),
     ("cq_update_df", pd.DataFrame()),
     ("ai_vis_update_df", pd.DataFrame()),
+    ("ai_vis_update_full_df", pd.DataFrame()),
     ("new_df", pd.DataFrame()),
     ("new_fetch", []),
     ("seo_new_df", pd.DataFrame()),
     ("ai_new_df", pd.DataFrame()),
     ("cq_new_df", pd.DataFrame()),
     ("ai_vis_new_df", pd.DataFrame()),
+    ("ai_vis_new_full_df", pd.DataFrame()),
 ]:
     if k not in st.session_state:
         st.session_state[k] = default
@@ -4363,6 +4366,14 @@ if st.session_state.mode == "update":
             target_url=bayut_url.strip(),
             competitors=competitors,
             device="mobile",
+            list_limit=6,
+        )
+        st.session_state.ai_vis_update_full_df = build_ai_visibility_table(
+            query=query_for_ai,
+            target_url=bayut_url.strip(),
+            competitors=competitors,
+            device="mobile",
+            list_limit=0,
         )
 
     if show_internal_fetch and st.session_state.update_fetch:
@@ -4410,6 +4421,17 @@ if st.session_state.mode == "update":
             st.info("Run analysis to see AI visibility signals.")
         else:
             render_table(st.session_state.ai_vis_update_df, drop_internal_url=True)
+            full_ai_vis_df = st.session_state.ai_vis_update_full_df
+            if full_ai_vis_df is None or full_ai_vis_df.empty:
+                full_ai_vis_df = st.session_state.ai_vis_update_df
+            st.download_button(
+                "Download full AI visibility (CSV)",
+                data=_to_csv_bytes(full_ai_vis_df),
+                file_name="ai_visibility_full.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_full_ai_visibility_update",
+            )
 
 
 # =====================================================
@@ -4501,6 +4523,14 @@ else:
             target_url="Not applicable",
             competitors=competitors,
             device="mobile",
+            list_limit=6,
+        )
+        st.session_state.ai_vis_new_full_df = build_ai_visibility_table(
+            query=query_for_ai,
+            target_url="Not applicable",
+            competitors=competitors,
+            device="mobile",
+            list_limit=0,
         )
 
     if show_internal_fetch and st.session_state.new_fetch:
