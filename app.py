@@ -535,6 +535,17 @@ table.data-table thead th{
   border-bottom: 1px solid hsl(var(--border)) !important;
   white-space: nowrap;
 }
+table.data-table tbody tr:first-child td{
+  background: hsl(var(--primary)) !important;
+  color: hsl(var(--primary-foreground)) !important;
+  font-weight: 800 !important;
+}
+table.data-table tbody tr:first-child td a{
+  color: hsl(var(--primary-foreground)) !important;
+}
+table.data-table tbody tr:first-child:hover td{
+  background: hsl(var(--primary)) !important;
+}
 table.data-table tbody td{
   padding: 10px 12px !important;
   border-top: 1px solid hsl(var(--border)) !important;
