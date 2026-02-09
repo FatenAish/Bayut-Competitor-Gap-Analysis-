@@ -4256,7 +4256,6 @@ for k, default in [
     ("ai_new_df", pd.DataFrame()),
     ("cq_new_df", pd.DataFrame()),
     ("ai_vis_new_df", pd.DataFrame()),
-    ("ai_vis_new_full_df", pd.DataFrame()),
 ]:
     if k not in st.session_state:
         st.session_state[k] = default
@@ -4425,12 +4424,12 @@ if st.session_state.mode == "update":
             if full_ai_vis_df is None or full_ai_vis_df.empty:
                 full_ai_vis_df = st.session_state.ai_vis_update_df
             st.download_button(
-                "Download full AI visibility (CSV)",
+                "Download full APY (CSV)",
                 data=_to_csv_bytes(full_ai_vis_df),
-                file_name="ai_visibility_full.csv",
+                file_name="full_apy.csv",
                 mime="text/csv",
                 use_container_width=True,
-                key="download_full_ai_visibility_update",
+                key="download_full_apy_update",
             )
 
 
@@ -4524,13 +4523,6 @@ else:
             competitors=competitors,
             device="mobile",
             list_limit=6,
-        )
-        st.session_state.ai_vis_new_full_df = build_ai_visibility_table(
-            query=query_for_ai,
-            target_url="Not applicable",
-            competitors=competitors,
-            device="mobile",
-            list_limit=0,
         )
 
     if show_internal_fetch and st.session_state.new_fetch:
