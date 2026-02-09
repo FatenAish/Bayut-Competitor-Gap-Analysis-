@@ -527,24 +527,13 @@ table.data-table{
   background: hsl(var(--card)) !important;
 }
 table.data-table thead th{
-  background: hsl(163 45% 95%) !important;
-  color: hsl(var(--foreground)) !important;
+  background: hsl(var(--primary)) !important;
+  color: hsl(var(--primary-foreground)) !important;
   font-weight: 900 !important;
   padding: 10px 12px !important;
   text-align: left !important;
   border-bottom: 1px solid hsl(var(--border)) !important;
   white-space: nowrap;
-}
-table.data-table tbody tr:first-child td{
-  background: hsl(var(--primary)) !important;
-  color: hsl(var(--primary-foreground)) !important;
-  font-weight: 800 !important;
-}
-table.data-table tbody tr:first-child td a{
-  color: hsl(var(--primary-foreground)) !important;
-}
-table.data-table tbody tr:first-child:hover td{
-  background: hsl(var(--primary)) !important;
 }
 table.data-table tbody td{
   padding: 10px 12px !important;
