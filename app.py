@@ -693,44 +693,6 @@ def looks_blocked(text: str) -> bool:
         "cloudflare", "access denied", "captcha", "forbidden", "service unavailable"
     ])
 
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1", "true", "yes", "on"}
-
-def _env_float(key: str, default: float) -> float:
-    v = os.getenv(key)
-    if v is None or str(v).strip() == "":
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-def _is_cloud_runtime() -> bool:
-    cloud_markers = [
-        "STREAMLIT_SHARING_MODE",
-        "STREAMLIT_CLOUD",
-        "K_SERVICE",
-        "RENDER",
-        "RAILWAY_ENVIRONMENT",
-        "FLY_APP_NAME",
-    ]
-    if any(os.getenv(k) for k in cloud_markers):
-        return True
-    host = str(os.getenv("HOSTNAME", "")).lower()
-    return "streamlitapp" in host
-
-IS_CLOUD_RUNTIME = _is_cloud_runtime()
-FETCH_RESOLVE_MODE = str(os.getenv("FETCH_RESOLVE_MODE", "auto")).strip().lower()
-if FETCH_RESOLVE_MODE not in {"auto", "direct_first", "jina_first"}:
-    FETCH_RESOLVE_MODE = "auto"
-if FETCH_RESOLVE_MODE == "auto":
-    FETCH_RESOLVE_MODE = "jina_first" if IS_CLOUD_RUNTIME else "direct_first"
-FETCH_DISABLE_PLAYWRIGHT = _env_bool("FETCH_DISABLE_PLAYWRIGHT", default=IS_CLOUD_RUNTIME)
-FETCH_URL_DELAY_SECONDS = _env_float("FETCH_URL_DELAY_SECONDS", 0.35 if IS_CLOUD_RUNTIME else 0.25)
-
 
 @dataclass
 class FetchResult:
@@ -745,10 +707,11 @@ class FetchResult:
 class FetchAgent:
     """
     Deterministic resolver:
-    - direct HTML / Jina reader (order depends on runtime mode)
-    - optional JS render (Playwright, if enabled)
+    - direct HTML
+    - optional JS render (Playwright)
+    - Jina reader
     - Textise
-    If all fail => caller decides whether to skip or stop.
+    If all fail => app forces manual paste (hard gate).
     """
 
     def __init__(self, default_headers: dict, ignore_tags: set, clean_fn, looks_blocked_fn):
@@ -808,7 +771,7 @@ class FetchAgent:
         return self.clean(article.get_text(" "))
 
     def _fetch_playwright_html(self, url: str, timeout_ms: int = 25000) -> Tuple[bool, str]:
-        if not PLAYWRIGHT_OK or FETCH_DISABLE_PLAYWRIGHT:
+        if not PLAYWRIGHT_OK:
             return False, ""
         try:
             with sync_playwright() as p:
@@ -829,56 +792,42 @@ class FetchAgent:
             return FetchResult(False, None, None, "", "", "empty_url")
 
         html_fallback = ""
-        last_status = None
-        steps = ["direct", "playwright", "jina", "textise"]
-        if FETCH_RESOLVE_MODE == "jina_first":
-            steps = ["jina", "direct", "playwright", "textise"]
 
-        for step in steps:
-            if step == "direct":
-                code, html = self._http_get(url)
-                if code:
-                    last_status = code
-                if code == 200 and html:
-                    text = self._extract_article_text_from_html(html)
-                    if self._validate_text(text, min_len=500):
-                        return FetchResult(True, "direct", code, html, text, None)
-                    html_fallback = html or html_fallback
-                continue
+        # 1) direct HTML
+        code, html = self._http_get(url)
+        if code == 200 and html:
+            text = self._extract_article_text_from_html(html)
+            if self._validate_text(text, min_len=500):
+                return FetchResult(True, "direct", code, html, text, None)
+            html_fallback = html
 
-            if step == "playwright":
-                ok, html2 = self._fetch_playwright_html(url)
-                if ok and html2:
-                    text2 = self._extract_article_text_from_html(html2)
-                    if self._validate_text(text2, min_len=500):
-                        return FetchResult(True, "playwright", 200, html2, text2, None)
-                    html_fallback = html2 or html_fallback
-                continue
+        # 2) JS-rendered HTML
+        ok, html2 = self._fetch_playwright_html(url)
+        if ok and html2:
+            text2 = self._extract_article_text_from_html(html2)
+            if self._validate_text(text2, min_len=500):
+                return FetchResult(True, "playwright", 200, html2, text2, None)
+            html_fallback = html2 or html_fallback
 
-            if step == "jina":
-                jurl = self._jina_url(url)
-                code3, txt3 = self._http_get(jurl)
-                if code3:
-                    last_status = code3
-                if code3 == 200 and txt3:
-                    text3 = self.clean(txt3)
-                    if self._validate_text(text3, min_len=500):
-                        return FetchResult(True, "jina", code3, html_fallback, text3, None)
-                continue
+        # 3) Jina reader
+        jurl = self._jina_url(url)
+        code3, txt3 = self._http_get(jurl)
+        if code3 == 200 and txt3:
+            text3 = self.clean(txt3)
+            if self._validate_text(text3, min_len=500):
+                return FetchResult(True, "jina", code3, html_fallback, text3, None)
 
-            if step == "textise":
-                turl = self._textise_url(url)
-                code4, html4 = self._http_get(turl)
-                if code4:
-                    last_status = code4
-                if code4 == 200 and html4:
-                    soup = BeautifulSoup(html4, "html.parser")
-                    text4 = self.clean(soup.get_text(" "))
-                    if self._validate_text(text4, min_len=350):
-                        html_out = html4 or html_fallback
-                        return FetchResult(True, "textise", code4, html_out, text4, None)
+        # 4) Textise
+        turl = self._textise_url(url)
+        code4, html4 = self._http_get(turl)
+        if code4 == 200 and html4:
+            soup = BeautifulSoup(html4, "html.parser")
+            text4 = self.clean(soup.get_text(" "))
+            if self._validate_text(text4, min_len=350):
+                html_out = html4 or html_fallback
+                return FetchResult(True, "textise", code4, html_out, text4, None)
 
-        return FetchResult(False, None, last_status, "", "", "blocked_or_no_content")
+        return FetchResult(False, None, code or None, "", "", "blocked_or_no_content")
 
 
 agent = FetchAgent(
@@ -901,8 +850,7 @@ def resolve_all_or_require_manual(agent: FetchAgent, urls: List[str], st_key_pre
     for u in urls:
         r = agent.resolve(u)
         results[u] = r
-        if FETCH_URL_DELAY_SECONDS > 0:
-            time.sleep(FETCH_URL_DELAY_SECONDS)
+        time.sleep(0.25)
     return results
 
 def split_fetch_results(urls: List[str], fr_map: Dict[str, FetchResult]) -> Tuple[List[str], List[str]]:
@@ -5015,9 +4963,7 @@ if st.session_state.mode == "update":
 
     if show_internal_fetch and st.session_state.update_fetch:
         st.sidebar.markdown("### Internal fetch log (Update Mode)")
-        st.sidebar.write(f"Fetch mode: {FETCH_RESOLVE_MODE}")
-        st.sidebar.write(f"Cloud runtime: {IS_CLOUD_RUNTIME}")
-        st.sidebar.write(f"Playwright enabled: {PLAYWRIGHT_OK and not FETCH_DISABLE_PLAYWRIGHT}")
+        st.sidebar.write(f"Playwright enabled: {PLAYWRIGHT_OK}")
         for u, s in st.session_state.update_fetch:
             st.sidebar.write(u, "—", s)
 
@@ -5171,9 +5117,7 @@ else:
 
     if show_internal_fetch and st.session_state.new_fetch:
         st.sidebar.markdown("### Internal fetch log (New Post Mode)")
-        st.sidebar.write(f"Fetch mode: {FETCH_RESOLVE_MODE}")
-        st.sidebar.write(f"Cloud runtime: {IS_CLOUD_RUNTIME}")
-        st.sidebar.write(f"Playwright enabled: {PLAYWRIGHT_OK and not FETCH_DISABLE_PLAYWRIGHT}")
+        st.sidebar.write(f"Playwright enabled: {PLAYWRIGHT_OK}")
         for u, s in st.session_state.new_fetch:
             st.sidebar.write(u, "—", s)
 
