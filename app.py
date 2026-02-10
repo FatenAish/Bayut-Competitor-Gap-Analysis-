@@ -622,7 +622,7 @@ st.markdown(
 
 
 # =====================================================
-# FETCH (NO MISSING COMPETITORS — ENFORCED)
+# FETCH (BEST-EFFORT; SKIP PROTECTED/UNFETCHABLE URLS)
 # =====================================================
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -844,36 +844,33 @@ def _safe_key(prefix: str, url: str) -> str:
 
 
 def resolve_all_or_require_manual(agent: FetchAgent, urls: List[str], st_key_prefix: str) -> Dict[str, FetchResult]:
+    _ = st_key_prefix  # kept for backward compatibility with existing call sites
     results: Dict[str, FetchResult] = {}
-    failed: List[str] = []
 
     for u in urls:
         r = agent.resolve(u)
         results[u] = r
-        if not r.ok:
-            failed.append(u)
         time.sleep(0.25)
-
-    if not failed:
-        return results
-
-    st.error("Some URLs could not be fetched automatically. Paste the article HTML/text for EACH failed URL to continue. (No missing URLs.)")
-
-    for u in failed:
-        with st.expander(f"Manual fallback required: {u}", expanded=True):
-            pasted = st.text_area(
-                "Paste the full article HTML OR readable article text:",
-                key=_safe_key(st_key_prefix + "__paste", u),
-                height=220,
-            )
-            if pasted and len(pasted.strip()) > 400:
-                results[u] = FetchResult(True, "manual", 200, pasted.strip(), pasted.strip(), None)
-
-    still_failed = [u for u in failed if not results[u].ok]
-    if still_failed:
-        st.stop()
-
     return results
+
+def split_fetch_results(urls: List[str], fr_map: Dict[str, FetchResult]) -> Tuple[List[str], List[str]]:
+    ok_urls: List[str] = []
+    failed_urls: List[str] = []
+    for u in urls:
+        fr = fr_map.get(u)
+        if fr and fr.ok:
+            ok_urls.append(u)
+        else:
+            failed_urls.append(u)
+    return ok_urls, failed_urls
+
+def fetch_failure_label(fr: Optional[FetchResult]) -> str:
+    if fr is None:
+        return "unfetchable"
+    reason = (fr.reason or "unfetchable").replace("_", " ")
+    if fr.status:
+        return f"{reason} (HTTP {fr.status})"
+    return reason
 # =====================================================
 # HEADING TREE + FILTERS
 # =====================================================
@@ -4906,20 +4903,37 @@ if st.session_state.mode == "update":
             st.error("Add at least one competitor URL.")
             st.stop()
 
-        with st.spinner("Fetching Bayut (no exceptions)…"):
+        with st.spinner("Fetching Bayut…"):
             bayut_fr_map = resolve_all_or_require_manual(agent, [bayut_url.strip()], st_key_prefix="bayut")
-            bayut_tree_map = ensure_headings_or_require_repaste([bayut_url.strip()], bayut_fr_map, st_key_prefix="bayut_tree")
         bayut_fr = bayut_fr_map[bayut_url.strip()]
+        if not bayut_fr.ok:
+            st.warning("Bayut URL appears protected/blocked and could not be fetched automatically.")
+            st.stop()
+        bayut_tree_map = ensure_headings_or_require_repaste([bayut_url.strip()], bayut_fr_map, st_key_prefix="bayut_tree")
         bayut_nodes = bayut_tree_map[bayut_url.strip()]["nodes"]
 
-        with st.spinner("Fetching ALL competitors (no exceptions)…"):
+        with st.spinner("Fetching competitors…"):
             comp_fr_map = resolve_all_or_require_manual(agent, competitors, st_key_prefix="comp_update")
-            comp_tree_map = ensure_headings_or_require_repaste(competitors, comp_fr_map, st_key_prefix="comp_update_tree")
+        usable_competitors, skipped_competitors = split_fetch_results(competitors, comp_fr_map)
+        if skipped_competitors and usable_competitors:
+            st.info(
+                f"Skipped {len(skipped_competitors)} protected/unfetchable competitor URL(s) and continued "
+                f"with {len(usable_competitors)}."
+            )
+        if not usable_competitors:
+            if len(competitors) == 1:
+                st.warning("The competitor website is protected/blocked and could not be fetched automatically.")
+            else:
+                st.warning("All competitor websites were protected/blocked or unreachable, so there is nothing to analyze.")
+            st.stop()
+        comp_tree_map = ensure_headings_or_require_repaste(
+            usable_competitors, comp_fr_map, st_key_prefix="comp_update_tree"
+        )
 
         all_rows = []
         internal_fetch = []
 
-        for comp_url in competitors:
+        for comp_url in usable_competitors:
             src = comp_fr_map[comp_url].source
             internal_fetch.append((comp_url, f"ok ({src})"))
             comp_nodes = comp_tree_map[comp_url]["nodes"]
@@ -4931,6 +4945,8 @@ if st.session_state.mode == "update":
                 comp_fr=comp_fr_map[comp_url],
                 comp_url=comp_url,
             ))
+        for comp_url in skipped_competitors:
+            internal_fetch.append((comp_url, f"skipped ({fetch_failure_label(comp_fr_map.get(comp_url))})"))
 
         st.session_state.update_fetch = internal_fetch
         st.session_state.update_df = (
@@ -4943,7 +4959,7 @@ if st.session_state.mode == "update":
             bayut_url=bayut_url.strip(),
             bayut_fr=bayut_fr,
             bayut_nodes=bayut_nodes,
-            competitors=competitors,
+            competitors=usable_competitors,
             comp_fr_map=comp_fr_map,
             comp_tree_map=comp_tree_map,
             manual_fkw=manual_fkw_update.strip()
@@ -4956,8 +4972,8 @@ if st.session_state.mode == "update":
 
         st.session_state.cq_update_df = build_content_quality_table_from_seo(
             seo_df=st.session_state.seo_update_df,
-            fr_map_by_url={bayut_url.strip(): bayut_fr, **comp_fr_map},
-            tree_map_by_url={bayut_url.strip(): {"nodes": bayut_nodes}, **{u: comp_tree_map[u] for u in competitors}},
+            fr_map_by_url={bayut_url.strip(): bayut_fr, **{u: comp_fr_map[u] for u in usable_competitors}},
+            tree_map_by_url={bayut_url.strip(): {"nodes": bayut_nodes}, **{u: comp_tree_map[u] for u in usable_competitors}},
             manual_query=manual_fkw_update.strip(),
             manual_query_secondary=manual_fkw2_update.strip()
         )
@@ -4966,7 +4982,7 @@ if st.session_state.mode == "update":
         st.session_state.ai_vis_update_df = build_ai_visibility_table(
             query=query_for_ai,
             target_url=bayut_url.strip(),
-            competitors=competitors,
+            competitors=usable_competitors,
             device="mobile",
         )
 
@@ -5059,18 +5075,34 @@ else:
             st.error("Add at least one competitor URL.")
             st.stop()
 
-        with st.spinner("Fetching ALL competitors (no exceptions)…"):
+        with st.spinner("Fetching competitors…"):
             comp_fr_map = resolve_all_or_require_manual(agent, competitors, st_key_prefix="comp_new")
-            comp_tree_map = ensure_headings_or_require_repaste(competitors, comp_fr_map, st_key_prefix="comp_new_tree")
+        usable_competitors, skipped_competitors = split_fetch_results(competitors, comp_fr_map)
+        if skipped_competitors and usable_competitors:
+            st.info(
+                f"Skipped {len(skipped_competitors)} protected/unfetchable competitor URL(s) and continued "
+                f"with {len(usable_competitors)}."
+            )
+        if not usable_competitors:
+            if len(competitors) == 1:
+                st.warning("The competitor website is protected/blocked and could not be fetched automatically.")
+            else:
+                st.warning("All competitor websites were protected/blocked or unreachable, so there is nothing to analyze.")
+            st.stop()
+        comp_tree_map = ensure_headings_or_require_repaste(
+            usable_competitors, comp_fr_map, st_key_prefix="comp_new_tree"
+        )
 
         rows = []
         internal_fetch = []
 
-        for comp_url in competitors:
+        for comp_url in usable_competitors:
             src = comp_fr_map[comp_url].source
             internal_fetch.append((comp_url, f"ok ({src})"))
             comp_nodes = comp_tree_map[comp_url]["nodes"]
             rows.extend(new_post_coverage_rows(comp_nodes, comp_url))
+        for comp_url in skipped_competitors:
+            internal_fetch.append((comp_url, f"skipped ({fetch_failure_label(comp_fr_map.get(comp_url))})"))
 
         st.session_state.new_fetch = internal_fetch
         st.session_state.new_df = (
@@ -5081,7 +5113,7 @@ else:
 
         st.session_state.seo_new_df = build_seo_analysis_newpost(
             new_title=new_title.strip(),
-            competitors=competitors,
+            competitors=usable_competitors,
             comp_fr_map=comp_fr_map,
             comp_tree_map=comp_tree_map,
             manual_fkw=manual_fkw_new.strip()
@@ -5094,8 +5126,8 @@ else:
 
         st.session_state.cq_new_df = build_content_quality_table_from_seo(
             seo_df=st.session_state.seo_new_df,
-            fr_map_by_url={u: comp_fr_map[u] for u in competitors},
-            tree_map_by_url={u: comp_tree_map[u] for u in competitors},
+            fr_map_by_url={u: comp_fr_map[u] for u in usable_competitors},
+            tree_map_by_url={u: comp_tree_map[u] for u in usable_competitors},
             manual_query=manual_fkw_new.strip(),
             manual_query_secondary=manual_fkw2_new.strip()
         )
@@ -5104,7 +5136,7 @@ else:
         st.session_state.ai_vis_new_df = build_ai_visibility_table(
             query=query_for_ai,
             target_url="Not applicable",
-            competitors=competitors,
+            competitors=usable_competitors,
             device="mobile",
         )
 
