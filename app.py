@@ -1637,8 +1637,15 @@ def _faq_questions_from_html(html: str) -> List[str]:
 
     candidates = []
     for tag in soup.find_all(True):
-        id_attr = (tag.get("id") or "").lower()
-        cls_attr = " ".join(tag.get("class", []) or []).lower()
+        attrs = getattr(tag, "attrs", None)
+        if not isinstance(attrs, dict):
+            continue
+        cls_raw = attrs.get("class", [])
+        if isinstance(cls_raw, (list, tuple, set)):
+            cls_attr = " ".join(str(x) for x in cls_raw if x is not None).lower()
+        else:
+            cls_attr = str(cls_raw or "").lower()
+        id_attr = str(attrs.get("id", "") or "").lower()
         if re.search(r"\bfaq\b|\bfaqs\b|\baccordion\b|\bquestions\b", id_attr + " " + cls_attr):
             candidates.append(tag)
 
@@ -1741,8 +1748,15 @@ def _faq_pairs_from_html(html: str) -> List[dict]:
 
     candidates = []
     for tag in soup.find_all(True):
-        id_attr = (tag.get("id") or "").lower()
-        cls_attr = " ".join(tag.get("class", []) or []).lower()
+        attrs = getattr(tag, "attrs", None)
+        if not isinstance(attrs, dict):
+            continue
+        cls_raw = attrs.get("class", [])
+        if isinstance(cls_raw, (list, tuple, set)):
+            cls_attr = " ".join(str(x) for x in cls_raw if x is not None).lower()
+        else:
+            cls_attr = str(cls_raw or "").lower()
+        id_attr = str(attrs.get("id", "") or "").lower()
         if re.search(r"\bfaq\b|\bfaqs\b|\baccordion\b|\bquestions\b", id_attr + " " + cls_attr):
             candidates.append(tag)
 
