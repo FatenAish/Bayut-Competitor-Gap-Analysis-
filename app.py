@@ -884,7 +884,8 @@ NOISE_PATTERNS = [
     r"\bcontact (us|agent)\b", r"\bcall (us|now)\b", r"\bwhatsapp\b", r"\benquire\b",
     r"\binquire\b", r"\bbook a viewing\b",
     r"\bshare\b", r"\bshare this\b", r"\bfollow us\b", r"\blike\b", r"\bsubscribe\b",
-    r"\bnewsletter\b", r"\bsign up\b", r"\blogin\b", r"\bregister\b",
+    r"\bnewsletter\b", r"\bmailing list\b", r"\bjoin (our|the) (email )?list\b",
+    r"\bemail updates\b", r"\bstay updated\b", r"\bsign up\b", r"\blogin\b", r"\bregister\b",
     r"\brelated (posts|articles)\b", r"\byou may also like\b", r"\brecommended\b",
     r"\bpopular posts\b", r"\bmore articles\b", r"\blatest (blogs|blog|podcasts|podcast|insights)\b",
     r"\breal estate insights\b",
@@ -912,6 +913,82 @@ def norm_header(h: str) -> str:
     h = re.sub(r"[^a-z0-9\s]", "", h)
     h = re.sub(r"\s+", " ", h).strip()
     return h
+
+def _stem_token(tok: str) -> str:
+    t = clean(tok).lower()
+    if len(t) > 5 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s"):
+        return t[:-1]
+    return t
+
+def _tokenize_norm_words(text: str) -> List[str]:
+    return [_stem_token(t) for t in re.findall(r"[a-z0-9]+", norm_header(text))]
+
+HEADER_GENERIC_TOKENS = {
+    "section", "topic", "topics", "detail", "details", "overview",
+    "introduction", "intro", "guide", "key", "takeaway", "takeaways",
+    "information", "info",
+}
+
+SUBTOPIC_TOKEN_ALIASES = {
+    "ticket": {"ticket", "tickets", "entry", "entries", "admission", "price", "pricing", "cost", "fee", "fees"},
+    "timing": {"timing", "timings", "time", "times", "hour", "hours", "schedule", "opening", "closing"},
+    "location": {"location", "locations", "locat", "address", "where", "venue", "map"},
+}
+
+FAQ_FILLER_TOKENS = {
+    "faq", "faqs", "question", "questions", "attend", "attendance", "visitor", "visitors",
+    "visit", "visiting",
+}
+
+def _header_core_tokens(text: str) -> List[str]:
+    out = []
+    for tok in _tokenize_norm_words(text):
+        if not tok or len(tok) < 3:
+            continue
+        if tok in STOP or tok in HEADER_GENERIC_TOKENS:
+            continue
+        out.append(tok)
+    return out
+
+def _faq_core_tokens(text: str) -> List[str]:
+    out = []
+    for tok in _tokenize_norm_words(normalize_question(text)):
+        if not tok or len(tok) < 3:
+            continue
+        if tok in STOP or tok in FAQ_FILLER_TOKENS:
+            continue
+        out.append(tok)
+    return out
+
+def _subtopic_covered_in_text(subtopic: str, bayut_text: str) -> bool:
+    b_text = clean(bayut_text or "")
+    if not b_text:
+        return False
+
+    sub_n = norm_header(subtopic)
+    text_n = norm_header(b_text)
+    if sub_n and sub_n in text_n:
+        return True
+
+    sub_tokens = _header_core_tokens(subtopic)
+    if not sub_tokens:
+        return False
+
+    text_tokens = set(_tokenize_norm_words(b_text))
+    if not text_tokens:
+        return False
+
+    def token_hit(tok: str) -> bool:
+        aliases = {_stem_token(tok)}
+        aliases |= {_stem_token(a) for a in SUBTOPIC_TOKEN_ALIASES.get(_stem_token(tok), set())}
+        return bool(text_tokens & aliases)
+
+    hits = sum(1 for tok in sub_tokens if token_hit(tok))
+    if len(sub_tokens) <= 2:
+        return hits >= 1
+    return hits >= 2
 
 def header_is_faq(header: str) -> bool:
     nh = norm_header(header)
@@ -1498,6 +1575,44 @@ def faq_topics_from_questions(questions: List[str], limit: int = 10) -> List[str
             break
     return out
 
+def faq_questions_equivalent(a: str, b: str) -> bool:
+    a_q = normalize_question(a)
+    b_q = normalize_question(b)
+    if not a_q or not b_q:
+        return False
+
+    a_n = norm_header(a_q)
+    b_n = norm_header(b_q)
+    if a_n == b_n:
+        return True
+
+    if a_n and b_n and (a_n in b_n or b_n in a_n):
+        if min(len(a_n), len(b_n)) >= 12:
+            return True
+
+    a_topic = norm_header(faq_topic_from_question(a_q))
+    b_topic = norm_header(faq_topic_from_question(b_q))
+    if a_topic and b_topic:
+        if a_topic == b_topic:
+            return True
+        if (a_topic in b_topic or b_topic in a_topic) and min(len(a_topic), len(b_topic)) >= 10:
+            return True
+        if header_similarity(a_topic, b_topic) >= 0.82:
+            return True
+
+    a_tokens = set(_faq_core_tokens(a_q))
+    b_tokens = set(_faq_core_tokens(b_q))
+    if a_tokens and b_tokens:
+        overlap = len(a_tokens & b_tokens)
+        small = min(len(a_tokens), len(b_tokens))
+        if small >= 2 and overlap / max(small, 1) >= 0.8:
+            return True
+        jacc = overlap / max(len(a_tokens | b_tokens), 1)
+        if overlap >= 2 and jacc >= 0.67:
+            return True
+
+    return SequenceMatcher(None, a_n, b_n).ratio() >= 0.90
+
 def missing_faqs_row(
     bayut_nodes: List[dict],
     bayut_fr: FetchResult,
@@ -1519,15 +1634,11 @@ def missing_faqs_row(
         bayut_qs = extract_faq_questions(bayut_fr, bayut_nodes)
     bayut_qs = [q for q in bayut_qs if q and len(q) > 5]
 
-    def q_key(q: str) -> str:
-        q2 = normalize_question(q)
-        q2 = re.sub(r"[^a-z0-9\s]", "", q2.lower())
-        q2 = re.sub(r"\s+", " ", q2).strip()
-        return q2
-
-    bayut_set = {q_key(q) for q in bayut_qs if q}
-
-    missing_qs = [q for q in comp_qs if q_key(q) not in bayut_set]
+    missing_qs = []
+    for q in comp_qs:
+        if any(faq_questions_equivalent(q, bq) for bq in bayut_qs):
+            continue
+        missing_qs.append(q)
     if not missing_qs:
         return None
 
@@ -1597,11 +1708,30 @@ def header_similarity(a: str, b: str) -> float:
     b_n = norm_header(b)
     if not a_n or not b_n:
         return 0.0
+
     a_set = set(a_n.split())
     b_set = set(b_n.split())
     jacc = len(a_set & b_set) / max(len(a_set | b_set), 1) if a_set and b_set else 0.0
     seq = SequenceMatcher(None, a_n, b_n).ratio()
-    return (0.55 * seq) + (0.45 * jacc)
+    base = (0.55 * seq) + (0.45 * jacc)
+
+    # Extra semantic tolerance for cosmetic variants:
+    # "The Light Village" ~ "About Sharjah Light Village".
+    a_core = set(_header_core_tokens(a))
+    b_core = set(_header_core_tokens(b))
+    if not a_core or not b_core:
+        return base
+
+    core_jacc = len(a_core & b_core) / max(len(a_core | b_core), 1)
+    core_seq = SequenceMatcher(None, " ".join(sorted(a_core)), " ".join(sorted(b_core))).ratio()
+    core_score = (0.60 * core_seq) + (0.40 * core_jacc)
+
+    subset_bonus = 0.0
+    smallest = min(len(a_core), len(b_core))
+    if 2 <= smallest <= 3 and (a_core.issubset(b_core) or b_core.issubset(a_core)):
+        subset_bonus = 0.84
+
+    return max(base, core_score, subset_bonus)
 
 def find_best_bayut_match(comp_header: str, bayut_sections: List[dict], min_score: float = 0.73) -> Optional[dict]:
     best = None
@@ -1735,14 +1865,14 @@ def update_mode_rows_header_first(
             if p not in rows_map[key]["DescriptionParts"]:
                 rows_map[key]["DescriptionParts"].append(p)
 
-    def children_map(h3_list: List[dict]) -> Dict[str, List[dict]]:
+    def children_map(child_sections: List[dict]) -> Dict[str, List[dict]]:
         cmap: Dict[str, List[dict]] = {}
-        for h3 in h3_list:
-            parent = h3.get("parent_h2") or ""
+        for sec in child_sections:
+            parent = sec.get("parent_h2") or ""
             pk = norm_header(parent)
             if not pk:
                 continue
-            cmap.setdefault(pk, []).append(h3)
+            cmap.setdefault(pk, []).append(sec)
         return cmap
 
     def child_headers(cmap: Dict[str, List[dict]], parent_header: str) -> List[str]:
@@ -1759,11 +1889,14 @@ def update_mode_rows_header_first(
         child_content = " ".join(c.get("content", "") for c in cmap.get(pk, []))
         return clean(" ".join([h2_content, child_content]))
 
-    def missing_children(comp_children: List[str], bayut_children: List[str]) -> List[str]:
+    def missing_children(comp_children: List[str], bayut_children: List[str], bayut_text: str) -> List[str]:
         missing = []
         for ch in comp_children:
-            if not any(header_similarity(ch, bh) >= 0.73 for bh in bayut_children):
-                missing.append(ch)
+            if any(header_similarity(ch, bh) >= 0.73 for bh in bayut_children):
+                continue
+            if _subtopic_covered_in_text(ch, bayut_text):
+                continue
+            missing.append(ch)
         return missing
 
     def depth_gap_summary(comp_text: str, bayut_text: str) -> str:
@@ -1779,16 +1912,16 @@ def update_mode_rows_header_first(
             return ""
         return summarize_content_gap_action("", c_txt, b_txt)
 
-    bayut_secs = section_nodes(bayut_nodes, levels=(2, 3))
-    comp_secs = section_nodes(comp_nodes, levels=(2, 3))
+    bayut_secs = section_nodes(bayut_nodes, levels=(2, 3, 4))
+    comp_secs = section_nodes(comp_nodes, levels=(2, 3, 4))
 
     bayut_h2 = [s for s in bayut_secs if s["level"] == 2]
-    bayut_h3 = [s for s in bayut_secs if s["level"] == 3]
+    bayut_child_sections = [s for s in bayut_secs if s["level"] >= 3]
     comp_h2 = [s for s in comp_secs if s["level"] == 2]
-    comp_h3 = [s for s in comp_secs if s["level"] == 3]
+    comp_children_all = [s for s in comp_secs if s["level"] >= 3]
 
-    bayut_children_map = children_map(bayut_h3)
-    comp_children_map = children_map(comp_h3)
+    bayut_children_map = children_map(bayut_child_sections)
+    comp_children_map = children_map(comp_children_all)
 
     for cs in comp_h2:
         comp_header = cs.get("header", "")
@@ -1802,8 +1935,9 @@ def update_mode_rows_header_first(
             continue
 
         bayut_header = m["bayut_section"]["header"]
-        bayut_children = child_headers(bayut_children_map, bayut_header)
-        missing_sub = missing_children(comp_children, bayut_children)
+        bayut_child_headers = child_headers(bayut_children_map, bayut_header)
+        bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
+        missing_sub = missing_children(comp_children, bayut_child_headers, bayut_text)
 
         parts = []
         if missing_sub:
@@ -1811,7 +1945,6 @@ def update_mode_rows_header_first(
             if sub_list:
                 parts.append(f"Missing subtopics: {sub_list}.")
 
-        bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
         depth_note = depth_gap_summary(comp_text, bayut_text)
         if depth_note:
             parts.append(depth_note)
@@ -1820,11 +1953,11 @@ def update_mode_rows_header_first(
             add_row(comp_header, parts)
 
     comp_h2_norms = {norm_header(h.get("header", "")) for h in comp_h2}
-    for cs in comp_h3:
+    for cs in comp_children_all:
         parent = cs.get("parent_h2") or ""
         if parent and norm_header(parent) in comp_h2_norms:
             continue
-        m = find_best_bayut_match(cs["header"], bayut_h3 + bayut_h2, min_score=0.73)
+        m = find_best_bayut_match(cs["header"], bayut_child_sections + bayut_h2, min_score=0.73)
         if m:
             continue
         desc = summarize_missing_section_action(cs["header"], None, cs.get("content", ""))
