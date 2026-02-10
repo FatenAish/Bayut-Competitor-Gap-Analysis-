@@ -913,6 +913,7 @@ HIGH_PRECISION_MODE = True
 MISSING_HEADER_MIN_TEXT_COVERAGE = 0.72
 MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.70
 MISSING_FAQ_MIN_TEXT_COVERAGE = 0.65
+SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE = 0.45
 
 def norm_header(h: str) -> str:
     h = clean(h).lower()
@@ -1787,8 +1788,14 @@ def missing_faqs_row(
         if HIGH_PRECISION_MODE and faq_question_covered_in_text(q, bayut_corpus):
             continue
         missing_qs.append(q)
-    if HIGH_PRECISION_MODE and len(missing_qs) < 2:
-        return None
+
+    # In strict mode, allow a single FAQ gap only when it's clearly missing.
+    if HIGH_PRECISION_MODE and len(missing_qs) == 1:
+        only_q = missing_qs[0]
+        only_topic = faq_topic_from_question(only_q)
+        topic_cov = _topic_coverage_ratio(only_topic, bayut_corpus) if only_topic else 0.0
+        if topic_cov >= SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE:
+            return None
     if not missing_qs:
         return None
 
