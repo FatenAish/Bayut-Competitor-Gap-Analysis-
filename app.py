@@ -2412,32 +2412,32 @@ def _missing_content_points(
     return out
 
 def summarize_missing_section_action(header: str, subheaders: Optional[List[str]], comp_content: str) -> str:
-    themes = list(theme_flags(comp_content))
-    human_map = {
-        "transport": "commute & connectivity",
-        "traffic_parking": "traffic/parking realities",
-        "cost": "cost considerations",
-        "lifestyle": "lifestyle & vibe",
-        "daily_life": "day-to-day convenience",
-        "safety": "safety angle",
-        "decision_frame": "decision framing",
-        "comparison": "comparison context",
-    }
-    picks = [human_map.get(x, x) for x in themes]
     parts = []
     if subheaders:
-        sub_list = format_gap_list(subheaders, limit=6)
+        sub_list = format_gap_list(subheaders, limit=3)
         if sub_list:
             parts.append(f"Missing subtopics: {sub_list}.")
-    if picks:
-        theme_list = format_gap_list(picks, limit=4)
-        if theme_list:
-            parts.append(f"Missing coverage on: {theme_list}.")
     seed_points = _important_points_in_text(comp_content, limit=4)
     if seed_points:
         seed_list = format_gap_list(seed_points, limit=4)
         if seed_list:
             parts.append(f"Add this header and cover important points: {seed_list}.")
+    else:
+        themes = list(theme_flags(comp_content))
+        human_map = {
+            "transport": "commute & connectivity",
+            "traffic_parking": "traffic/parking realities",
+            "cost": "cost considerations",
+            "lifestyle": "lifestyle & vibe",
+            "daily_life": "day-to-day convenience",
+            "safety": "safety angle",
+            "decision_frame": "decision framing",
+            "comparison": "comparison context",
+        }
+        picks = [human_map.get(x, x) for x in themes]
+        theme_list = format_gap_list(picks, limit=3)
+        if theme_list:
+            parts.append(f"Missing coverage on: {theme_list}.")
     if not parts:
         parts.append("Add this header and include practical competitor-level detail.")
     return " ".join(parts)
