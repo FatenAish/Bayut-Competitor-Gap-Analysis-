@@ -910,9 +910,9 @@ GENERIC_STOP = {
 
 # Conservative defaults: prefer suppressing uncertain gaps over false positives.
 HIGH_PRECISION_MODE = True
-MISSING_HEADER_MIN_TEXT_COVERAGE = 0.90
-MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.88
-MISSING_FAQ_MIN_TEXT_COVERAGE = 0.85
+MISSING_HEADER_MIN_TEXT_COVERAGE = 0.72
+MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.70
+MISSING_FAQ_MIN_TEXT_COVERAGE = 0.65
 
 def norm_header(h: str) -> str:
     h = clean(h).lower()
@@ -934,7 +934,7 @@ def _tokenize_norm_words(text: str) -> List[str]:
 HEADER_GENERIC_TOKENS = {
     "section", "topic", "topics", "detail", "details", "overview",
     "introduction", "intro", "guide", "key", "takeaway", "takeaways",
-    "information", "info",
+    "information", "info", "top", "best", "popular", "main", "latest",
 }
 
 SUBTOPIC_TOKEN_ALIASES = {
@@ -943,14 +943,38 @@ SUBTOPIC_TOKEN_ALIASES = {
     "location": {"location", "locations", "locat", "address", "where", "venue", "map"},
 }
 
+TOPIC_TOKEN_ALIASES = {
+    "place": {"place", "places", "venue", "venues", "spot", "spots", "destination", "destinations", "location", "locations"},
+    "event": {"event", "events", "celebrate", "celebration", "festival", "festivals", "activity", "activities", "entertainment", "happening", "happenings"},
+    "tip": {"tip", "tips", "practical", "advice", "suggestion", "suggestions"},
+}
+
+LOW_SIGNAL_SUBTOPICS = {
+    "location", "contact", "contacts", "phone", "telephone", "website", "web site",
+    "address", "map", "directions",
+}
+
 FAQ_FILLER_TOKENS = {
     "faq", "faqs", "question", "questions", "attend", "attendance", "visitor", "visitors",
     "visit", "visiting",
 }
 
+def _canonical_topic_token(tok: str) -> str:
+    stem = _stem_token(tok)
+    for key, vals in TOPIC_TOKEN_ALIASES.items():
+        bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
+        if stem in bucket:
+            return _stem_token(key)
+    return stem
+
 def _token_aliases(tok: str) -> set:
     stem = _stem_token(tok)
     aliases = {stem}
+    for key, vals in TOPIC_TOKEN_ALIASES.items():
+        bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
+        if stem in bucket:
+            aliases |= bucket
+            break
     for key, vals in SUBTOPIC_TOKEN_ALIASES.items():
         bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
         if stem in bucket:
@@ -961,11 +985,12 @@ def _token_aliases(tok: str) -> set:
 def _header_core_tokens(text: str) -> List[str]:
     out = []
     for tok in _tokenize_norm_words(text):
-        if not tok or len(tok) < 3:
+        canon = _canonical_topic_token(tok)
+        if not canon or len(canon) < 3:
             continue
-        if tok in STOP or tok in HEADER_GENERIC_TOKENS:
+        if canon in STOP or canon in HEADER_GENERIC_TOKENS:
             continue
-        out.append(tok)
+        out.append(canon)
     return out
 
 def _faq_core_tokens(text: str) -> List[str]:
@@ -1016,6 +1041,17 @@ def _topic_coverage_ratio(topic: str, text: str) -> float:
         if text_tokens & _token_aliases(tok):
             hits += 1
     return hits / max(len(topic_tokens), 1)
+
+def _is_low_signal_subtopic(header: str) -> bool:
+    hn = norm_header(header or "")
+    if not hn:
+        return True
+    if hn in LOW_SIGNAL_SUBTOPICS:
+        return True
+    words = hn.split()
+    if len(words) == 1 and words[0] in {"location", "contact", "address", "map", "website", "phone"}:
+        return True
+    return False
 
 def _topic_is_covered(
     topic: str,
@@ -1644,6 +1680,28 @@ def faq_topic_covered_in_text(q: str, bayut_text: str) -> bool:
         return cov >= 1.0
     return cov >= MISSING_FAQ_MIN_TEXT_COVERAGE
 
+def faq_question_covered_in_text(q: str, bayut_text: str) -> bool:
+    qn = normalize_question(q)
+    if not qn:
+        return False
+    qn_norm = norm_header(qn)
+    b_norm = norm_header(bayut_text or "")
+    if qn_norm and len(qn_norm) >= 16 and qn_norm in b_norm:
+        return True
+
+    q_tokens = set(_faq_core_tokens(qn))
+    if not q_tokens:
+        return False
+    b_tokens = set(_tokenize_norm_words(bayut_text or ""))
+    if not b_tokens:
+        return False
+
+    overlap = len(q_tokens & b_tokens)
+    ratio = overlap / max(len(q_tokens), 1)
+    if len(q_tokens) <= 2:
+        return ratio >= 1.0
+    return ratio >= 0.70
+
 def faq_topics_from_questions(questions: List[str], limit: int = 10) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -1726,7 +1784,11 @@ def missing_faqs_row(
             continue
         if HIGH_PRECISION_MODE and faq_topic_covered_in_text(q, bayut_corpus):
             continue
+        if HIGH_PRECISION_MODE and faq_question_covered_in_text(q, bayut_corpus):
+            continue
         missing_qs.append(q)
+    if HIGH_PRECISION_MODE and len(missing_qs) < 2:
+        return None
     if not missing_qs:
         return None
 
@@ -1986,6 +2048,8 @@ def update_mode_rows_header_first(
         missing = []
         child_section_objs = [{"header": h} for h in bayut_children if clean(h)]
         for ch in comp_children:
+            if HIGH_PRECISION_MODE and _is_low_signal_subtopic(ch):
+                continue
             if _topic_is_covered(ch, child_section_objs, bayut_text, min_header_score=0.73, min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE):
                 continue
             if _subtopic_covered_in_text(ch, bayut_text):
