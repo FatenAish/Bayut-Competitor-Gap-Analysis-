@@ -622,7 +622,7 @@ st.markdown(
 
 
 # =====================================================
-# FETCH (NO MISSING COMPETITORS — ENFORCED)
+# FETCH (BEST-EFFORT; SKIP PROTECTED/UNFETCHABLE URLS)
 # =====================================================
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -844,36 +844,33 @@ def _safe_key(prefix: str, url: str) -> str:
 
 
 def resolve_all_or_require_manual(agent: FetchAgent, urls: List[str], st_key_prefix: str) -> Dict[str, FetchResult]:
+    _ = st_key_prefix  # kept for backward compatibility with existing call sites
     results: Dict[str, FetchResult] = {}
-    failed: List[str] = []
 
     for u in urls:
         r = agent.resolve(u)
         results[u] = r
-        if not r.ok:
-            failed.append(u)
         time.sleep(0.25)
-
-    if not failed:
-        return results
-
-    st.error("Some URLs could not be fetched automatically. Paste the article HTML/text for EACH failed URL to continue. (No missing URLs.)")
-
-    for u in failed:
-        with st.expander(f"Manual fallback required: {u}", expanded=True):
-            pasted = st.text_area(
-                "Paste the full article HTML OR readable article text:",
-                key=_safe_key(st_key_prefix + "__paste", u),
-                height=220,
-            )
-            if pasted and len(pasted.strip()) > 400:
-                results[u] = FetchResult(True, "manual", 200, pasted.strip(), pasted.strip(), None)
-
-    still_failed = [u for u in failed if not results[u].ok]
-    if still_failed:
-        st.stop()
-
     return results
+
+def split_fetch_results(urls: List[str], fr_map: Dict[str, FetchResult]) -> Tuple[List[str], List[str]]:
+    ok_urls: List[str] = []
+    failed_urls: List[str] = []
+    for u in urls:
+        fr = fr_map.get(u)
+        if fr and fr.ok:
+            ok_urls.append(u)
+        else:
+            failed_urls.append(u)
+    return ok_urls, failed_urls
+
+def fetch_failure_label(fr: Optional[FetchResult]) -> str:
+    if fr is None:
+        return "unfetchable"
+    reason = (fr.reason or "unfetchable").replace("_", " ")
+    if fr.status:
+        return f"{reason} (HTTP {fr.status})"
+    return reason
 # =====================================================
 # HEADING TREE + FILTERS
 # =====================================================
@@ -884,7 +881,8 @@ NOISE_PATTERNS = [
     r"\bcontact (us|agent)\b", r"\bcall (us|now)\b", r"\bwhatsapp\b", r"\benquire\b",
     r"\binquire\b", r"\bbook a viewing\b",
     r"\bshare\b", r"\bshare this\b", r"\bfollow us\b", r"\blike\b", r"\bsubscribe\b",
-    r"\bnewsletter\b", r"\bsign up\b", r"\blogin\b", r"\bregister\b",
+    r"\bnewsletter\b", r"\bmailing list\b", r"\bjoin (our|the) (email )?list\b",
+    r"\bemail updates\b", r"\bstay updated\b", r"\bsign up\b", r"\blogin\b", r"\bregister\b",
     r"\brelated (posts|articles)\b", r"\byou may also like\b", r"\brecommended\b",
     r"\bpopular posts\b", r"\bmore articles\b", r"\blatest (blogs|blog|podcasts|podcast|insights)\b",
     r"\breal estate insights\b",
@@ -907,11 +905,197 @@ GENERIC_STOP = {
     "property","properties","rent","sale","apartments","villas","guide"
 }
 
+# Conservative defaults: prefer suppressing uncertain gaps over false positives.
+HIGH_PRECISION_MODE = True
+MISSING_HEADER_MIN_TEXT_COVERAGE = 0.72
+MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.70
+MISSING_FAQ_MIN_TEXT_COVERAGE = 0.65
+SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE = 0.45
+
 def norm_header(h: str) -> str:
     h = clean(h).lower()
     h = re.sub(r"[^a-z0-9\s]", "", h)
     h = re.sub(r"\s+", " ", h).strip()
     return h
+
+def _stem_token(tok: str) -> str:
+    t = clean(tok).lower()
+    if len(t) > 5 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s"):
+        return t[:-1]
+    return t
+
+def _tokenize_norm_words(text: str) -> List[str]:
+    return [_stem_token(t) for t in re.findall(r"[a-z0-9]+", norm_header(text))]
+
+HEADER_GENERIC_TOKENS = {
+    "section", "topic", "topics", "detail", "details", "overview",
+    "introduction", "intro", "guide", "key", "takeaway", "takeaways",
+    "information", "info", "top", "best", "popular", "main", "latest",
+}
+
+SUBTOPIC_TOKEN_ALIASES = {
+    "ticket": {"ticket", "tickets", "entry", "entries", "admission", "price", "pricing", "cost", "fee", "fees"},
+    "timing": {"timing", "timings", "time", "times", "hour", "hours", "schedule", "opening", "closing"},
+    "location": {"location", "locations", "locat", "address", "where", "venue", "map"},
+}
+
+TOPIC_TOKEN_ALIASES = {
+    "place": {"place", "places", "venue", "venues", "spot", "spots", "destination", "destinations", "location", "locations"},
+    "event": {"event", "events", "celebrate", "celebration", "festival", "festivals", "activity", "activities", "entertainment", "happening", "happenings"},
+    "tip": {"tip", "tips", "practical", "advice", "suggestion", "suggestions"},
+}
+
+LOW_SIGNAL_SUBTOPICS = {
+    "location", "contact", "contacts", "phone", "telephone", "website", "web site",
+    "address", "map", "directions",
+}
+
+FAQ_FILLER_TOKENS = {
+    "faq", "faqs", "question", "questions", "attend", "attendance", "visitor", "visitors",
+    "visit", "visiting",
+}
+
+def _canonical_topic_token(tok: str) -> str:
+    stem = _stem_token(tok)
+    for key, vals in TOPIC_TOKEN_ALIASES.items():
+        bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
+        if stem in bucket:
+            return _stem_token(key)
+    return stem
+
+def _token_aliases(tok: str) -> set:
+    stem = _stem_token(tok)
+    aliases = {stem}
+    for key, vals in TOPIC_TOKEN_ALIASES.items():
+        bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
+        if stem in bucket:
+            aliases |= bucket
+            break
+    for key, vals in SUBTOPIC_TOKEN_ALIASES.items():
+        bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
+        if stem in bucket:
+            aliases |= bucket
+            break
+    return aliases
+
+def _header_core_tokens(text: str) -> List[str]:
+    out = []
+    for tok in _tokenize_norm_words(text):
+        canon = _canonical_topic_token(tok)
+        if not canon or len(canon) < 3:
+            continue
+        if canon in STOP or canon in HEADER_GENERIC_TOKENS:
+            continue
+        out.append(canon)
+    return out
+
+def _faq_core_tokens(text: str) -> List[str]:
+    out = []
+    for tok in _tokenize_norm_words(normalize_question(text)):
+        if not tok or len(tok) < 3:
+            continue
+        if tok in STOP or tok in FAQ_FILLER_TOKENS:
+            continue
+        out.append(tok)
+    return out
+
+def _subtopic_covered_in_text(subtopic: str, bayut_text: str) -> bool:
+    b_text = clean(bayut_text or "")
+    if not b_text:
+        return False
+
+    sub_n = norm_header(subtopic)
+    text_n = norm_header(b_text)
+    if sub_n and sub_n in text_n:
+        return True
+
+    sub_tokens = _header_core_tokens(subtopic)
+    if not sub_tokens:
+        return False
+
+    text_tokens = set(_tokenize_norm_words(b_text))
+    if not text_tokens:
+        return False
+
+    def token_hit(tok: str) -> bool:
+        return bool(text_tokens & _token_aliases(tok))
+
+    hits = sum(1 for tok in sub_tokens if token_hit(tok))
+    if len(sub_tokens) <= 2:
+        return hits >= 1
+    return hits >= 2
+
+def _topic_coverage_ratio(topic: str, text: str) -> float:
+    topic_tokens = _header_core_tokens(topic)
+    if not topic_tokens:
+        return 0.0
+    text_tokens = set(_tokenize_norm_words(text or ""))
+    if not text_tokens:
+        return 0.0
+    hits = 0
+    for tok in topic_tokens:
+        if text_tokens & _token_aliases(tok):
+            hits += 1
+    return hits / max(len(topic_tokens), 1)
+
+def _is_low_signal_subtopic(header: str) -> bool:
+    hn = norm_header(header or "")
+    if not hn:
+        return True
+    if hn in LOW_SIGNAL_SUBTOPICS:
+        return True
+    words = hn.split()
+    if len(words) == 1 and words[0] in {"location", "contact", "address", "map", "website", "phone"}:
+        return True
+    return False
+
+def _topic_is_covered(
+    topic: str,
+    bayut_sections: List[dict],
+    bayut_text: str,
+    min_header_score: float = 0.73,
+    min_text_coverage: float = 0.90,
+) -> bool:
+    t = clean(topic or "")
+    if not t:
+        return True
+
+    best_header = 0.0
+    for sec in bayut_sections or []:
+        h = clean(sec.get("header", ""))
+        if not h:
+            continue
+        best_header = max(best_header, header_similarity(t, h))
+    if best_header >= min_header_score:
+        return True
+
+    text_n = norm_header(bayut_text or "")
+    topic_n = norm_header(t)
+    if topic_n and len(topic_n) >= 14 and topic_n in text_n:
+        return True
+
+    coverage = _topic_coverage_ratio(t, bayut_text)
+    toks = _header_core_tokens(t)
+    if not toks:
+        return False
+    if len(toks) <= 2:
+        return coverage >= 1.0
+    return coverage >= min_text_coverage
+
+def _coverage_corpus(fr: FetchResult, nodes: List[dict]) -> str:
+    parts = []
+    if fr and fr.text:
+        parts.append(fr.text)
+    for x in flatten(nodes or []):
+        h = clean(x.get("header", ""))
+        c = clean(x.get("content", ""))
+        if h:
+            parts.append(h)
+        if c:
+            parts.append(c)
+    return clean(" ".join(parts))
 
 def header_is_faq(header: str) -> bool:
     nh = norm_header(header)
@@ -1223,6 +1407,20 @@ def get_first_h1(nodes: List[dict]) -> str:
 # STRICT FAQ DETECTION (REAL FAQ ONLY)
 # =====================================================
 FAQ_TITLES = {"faq","faqs","frequently asked questions","frequently asked question"}
+MONTH_NAME_TO_NUM = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
 
 def _looks_like_question(s: str) -> bool:
     s = clean(s)
@@ -1375,6 +1573,129 @@ def _faq_questions_from_html(html: str) -> List[str]:
         out.append(q)
     return out
 
+def _faq_pairs_from_schema(html: str) -> List[dict]:
+    if not html:
+        return []
+    out: List[dict] = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        scripts = soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)})
+        for s in scripts:
+            raw = (s.string or s.get_text(" ") or "").strip()
+            if not raw:
+                continue
+            try:
+                j = json.loads(raw)
+            except Exception:
+                continue
+
+            def _add_pair(q: str, a: str = ""):
+                qn = normalize_question(q)
+                an = clean(re.sub(r"<[^>]+>", " ", str(a or "")))
+                if not qn or len(qn) < 6 or len(qn) > 180:
+                    return
+                out.append({"question": qn, "answer": an})
+
+            def _walk(x):
+                if isinstance(x, dict):
+                    t = x.get("@type") or x.get("type")
+                    t_list = []
+                    if isinstance(t, list):
+                        t_list = [str(z).lower() for z in t]
+                    elif isinstance(t, str):
+                        t_list = [t.lower()]
+
+                    if any("question" == z or z.endswith("question") for z in t_list):
+                        q = x.get("name") or x.get("text") or ""
+                        a = ""
+                        ans_obj = x.get("acceptedAnswer") or x.get("answer") or {}
+                        if isinstance(ans_obj, dict):
+                            a = ans_obj.get("text") or ans_obj.get("name") or ""
+                        elif isinstance(ans_obj, str):
+                            a = ans_obj
+                        if q:
+                            _add_pair(q, a)
+                    for v in x.values():
+                        _walk(v)
+                elif isinstance(x, list):
+                    for v in x:
+                        _walk(v)
+
+            _walk(j)
+    except Exception:
+        return []
+
+    dedup: Dict[str, dict] = {}
+    for p in out:
+        k = norm_header(p.get("question", ""))
+        if not k:
+            continue
+        if k not in dedup:
+            dedup[k] = p
+            continue
+        # Prefer richer answer text when duplicate questions appear.
+        if len(clean(p.get("answer", ""))) > len(clean(dedup[k].get("answer", ""))):
+            dedup[k] = p
+    return list(dedup.values())
+
+def _faq_pairs_from_html(html: str) -> List[dict]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup.find_all(list(IGNORE_TAGS)):
+        t.decompose()
+
+    pairs: List[dict] = []
+    pairs.extend(_faq_pairs_from_schema(html))
+
+    candidates = []
+    for tag in soup.find_all(True):
+        id_attr = (tag.get("id") or "").lower()
+        cls_attr = " ".join(tag.get("class", []) or []).lower()
+        if re.search(r"\bfaq\b|\bfaqs\b|\baccordion\b|\bquestions\b", id_attr + " " + cls_attr):
+            candidates.append(tag)
+
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+        if header_is_faq(h.get_text(" ")):
+            candidates.append(h.parent or h)
+
+    for c in candidates[:10]:
+        pending_q = ""
+        pending_idx = -1
+        for el in c.find_all(["summary", "button", "h3", "h4", "h5", "strong", "p", "li", "dt", "dd"]):
+            txt = clean(el.get_text(" "))
+            if not txt or len(txt) < 6:
+                continue
+            if len(txt) > 320:
+                continue
+            if _looks_like_question(txt):
+                qn = normalize_question(txt)
+                if qn:
+                    pairs.append({"question": qn, "answer": ""})
+                    pending_q = qn
+                    pending_idx = len(pairs) - 1
+                continue
+            if pending_q and pending_idx >= 0 and pending_idx < len(pairs):
+                # First nearby non-question block after question acts as answer.
+                if not pairs[pending_idx].get("answer", ""):
+                    pairs[pending_idx]["answer"] = txt
+
+    dedup: Dict[str, dict] = {}
+    for p in pairs:
+        q = clean(p.get("question", ""))
+        if not q:
+            continue
+        k = norm_header(q)
+        if not k:
+            continue
+        a = clean(p.get("answer", ""))
+        if k not in dedup:
+            dedup[k] = {"question": q, "answer": a}
+            continue
+        if len(a) > len(clean(dedup[k].get("answer", ""))):
+            dedup[k]["answer"] = a
+    return list(dedup.values())
+
 def _faq_heading_nodes(nodes: List[dict]) -> List[dict]:
     out = []
     for x in flatten(nodes):
@@ -1456,6 +1777,44 @@ def extract_faq_questions(fr: FetchResult, nodes: List[dict]) -> List[str]:
         out.append(q)
     return out
 
+def _faq_pairs_from_nodes(nodes: List[dict]) -> List[dict]:
+    pairs: List[dict] = []
+    for fn in _faq_heading_nodes(nodes):
+        for c in fn.get("children", []) or []:
+            q = clean(c.get("header", ""))
+            if not q or not _looks_like_question(q):
+                continue
+            a = clean(c.get("content", ""))
+            pairs.append({"question": normalize_question(q), "answer": a})
+    return pairs
+
+def extract_faq_pairs(fr: FetchResult, nodes: List[dict]) -> List[dict]:
+    pairs: List[dict] = []
+    if fr and fr.html:
+        pairs.extend(_faq_pairs_from_html(fr.html))
+    pairs.extend(_faq_pairs_from_nodes(nodes))
+
+    # Backfill questions without answers from question-only extraction.
+    q_only = extract_faq_questions(fr, nodes)
+    for q in q_only:
+        pairs.append({"question": normalize_question(q), "answer": ""})
+
+    dedup: Dict[str, dict] = {}
+    for p in pairs:
+        q = clean(p.get("question", ""))
+        if not q:
+            continue
+        k = norm_header(q)
+        if not k:
+            continue
+        a = clean(p.get("answer", ""))
+        if k not in dedup:
+            dedup[k] = {"question": q, "answer": a}
+            continue
+        if len(a) > len(clean(dedup[k].get("answer", ""))):
+            dedup[k]["answer"] = a
+    return list(dedup.values())
+
 def faq_topic_from_question(q: str) -> str:
     raw = normalize_question(q)
     if not raw:
@@ -1482,6 +1841,42 @@ def faq_topic_from_question(q: str) -> str:
         return ""
     return topic[:1].upper() + topic[1:]
 
+def faq_topic_covered_in_text(q: str, bayut_text: str) -> bool:
+    topic = faq_topic_from_question(q)
+    if not topic:
+        return False
+    cov = _topic_coverage_ratio(topic, bayut_text)
+    toks = _header_core_tokens(topic)
+    if not toks:
+        return False
+    if len(toks) <= 2:
+        return cov >= 1.0
+    return cov >= MISSING_FAQ_MIN_TEXT_COVERAGE
+
+def faq_question_covered_in_text(q: str, bayut_text: str) -> bool:
+    qn = normalize_question(q)
+    if not qn:
+        return False
+    qn_norm = norm_header(qn)
+    b_norm = norm_header(bayut_text or "")
+    if qn_norm and len(qn_norm) >= 16 and qn_norm in b_norm:
+        return True
+
+    q_tokens = set(_faq_core_tokens(qn))
+    if not q_tokens:
+        return False
+    b_tokens = set(_tokenize_norm_words(bayut_text or ""))
+    if not b_tokens:
+        return False
+
+    overlap = len(q_tokens & b_tokens)
+    ratio = overlap / max(len(q_tokens), 1)
+    if len(q_tokens) <= 2:
+        return ratio >= 1.0
+    if len(q_tokens) == 3:
+        return ratio >= 0.85
+    return ratio >= 0.80
+
 def faq_topics_from_questions(questions: List[str], limit: int = 10) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -1498,6 +1893,106 @@ def faq_topics_from_questions(questions: List[str], limit: int = 10) -> List[str
             break
     return out
 
+def faq_questions_equivalent(a: str, b: str) -> bool:
+    a_q = normalize_question(a)
+    b_q = normalize_question(b)
+    if not a_q or not b_q:
+        return False
+
+    a_n = norm_header(a_q)
+    b_n = norm_header(b_q)
+    if a_n == b_n:
+        return True
+
+    if a_n and b_n and (a_n in b_n or b_n in a_n):
+        if min(len(a_n), len(b_n)) >= 12:
+            return True
+
+    a_topic = norm_header(faq_topic_from_question(a_q))
+    b_topic = norm_header(faq_topic_from_question(b_q))
+    if a_topic and b_topic:
+        if a_topic == b_topic:
+            return True
+        if (a_topic in b_topic or b_topic in a_topic) and min(len(a_topic), len(b_topic)) >= 10:
+            return True
+        if header_similarity(a_topic, b_topic) >= 0.82:
+            return True
+
+    a_tokens = set(_faq_core_tokens(a_q))
+    b_tokens = set(_faq_core_tokens(b_q))
+    if a_tokens and b_tokens:
+        overlap = len(a_tokens & b_tokens)
+        small = min(len(a_tokens), len(b_tokens))
+        if small >= 2 and overlap / max(small, 1) >= 0.8:
+            return True
+        jacc = overlap / max(len(a_tokens | b_tokens), 1)
+        if overlap >= 2 and jacc >= 0.67:
+            return True
+
+    return SequenceMatcher(None, a_n, b_n).ratio() >= 0.90
+
+def faq_questions_related(a: str, b: str) -> bool:
+    if faq_questions_equivalent(a, b):
+        return True
+    a_topic = faq_topic_from_question(a)
+    b_topic = faq_topic_from_question(b)
+    if a_topic and b_topic and header_similarity(a_topic, b_topic) >= 0.64:
+        return True
+
+    a_tokens = set(_faq_core_tokens(a))
+    b_tokens = set(_faq_core_tokens(b))
+    if not a_tokens or not b_tokens:
+        return False
+
+    overlap = a_tokens & b_tokens
+    if len(overlap) >= 2:
+        return True
+    anchor = overlap & {
+        "restaurant", "menu", "reservation", "book", "booking",
+        "event", "festival", "ticket", "free", "location",
+        "date", "time", "year", "global", "village",
+    }
+    if anchor:
+        return True
+    return False
+
+def _question_has_date_intent(q: str) -> bool:
+    qn = norm_header(normalize_question(q))
+    if not qn:
+        return False
+    return any(tok in qn for tok in ["when", "date", "day", "month", "year", "start", "begin"])
+
+def _extract_date_signatures(text: str) -> set:
+    t = clean(text or "").lower()
+    if not t:
+        return set()
+    out = set()
+    month_rgx = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+
+    for m in re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{month_rgx}\s+(\d{{4}})\b", t, flags=re.I):
+        day = int(m.group(1))
+        mon = MONTH_NAME_TO_NUM.get(m.group(2).lower(), 0)
+        year = int(m.group(3))
+        if mon and 1 <= day <= 31:
+            out.add(f"{year:04d}-{mon:02d}-{day:02d}")
+
+    for m in re.finditer(rf"\b{month_rgx}\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,)?\s+(\d{{4}})\b", t, flags=re.I):
+        mon = MONTH_NAME_TO_NUM.get(m.group(1).lower(), 0)
+        day = int(m.group(2))
+        year = int(m.group(3))
+        if mon and 1 <= day <= 31:
+            out.add(f"{year:04d}-{mon:02d}-{day:02d}")
+    return out
+
+def faq_answers_conflict(question: str, comp_answer: str, bayut_answer: str) -> bool:
+    if not _question_has_date_intent(question):
+        return False
+    c_dates = _extract_date_signatures(comp_answer)
+    b_dates = _extract_date_signatures(bayut_answer)
+    if c_dates and b_dates and c_dates.isdisjoint(b_dates):
+        return True
+    return False
+
 def missing_faqs_row(
     bayut_nodes: List[dict],
     bayut_fr: FetchResult,
@@ -1508,39 +2003,68 @@ def missing_faqs_row(
     if not page_has_real_faq(comp_fr, comp_nodes):
         return None
 
-    comp_qs = extract_faq_questions(comp_fr, comp_nodes)
-    comp_qs = [q for q in comp_qs if q and len(q) > 5]
-    if not comp_qs:
+    comp_pairs = extract_faq_pairs(comp_fr, comp_nodes)
+    comp_pairs = [p for p in comp_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
+    if not comp_pairs:
         return None
 
-    bayut_has = page_has_real_faq(bayut_fr, bayut_nodes)
-    bayut_qs = []
-    if bayut_has:
-        bayut_qs = extract_faq_questions(bayut_fr, bayut_nodes)
-    bayut_qs = [q for q in bayut_qs if q and len(q) > 5]
+    bayut_pairs = extract_faq_pairs(bayut_fr, bayut_nodes) if page_has_real_faq(bayut_fr, bayut_nodes) else []
+    bayut_pairs = [p for p in bayut_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
 
-    def q_key(q: str) -> str:
-        q2 = normalize_question(q)
-        q2 = re.sub(r"[^a-z0-9\s]", "", q2.lower())
-        q2 = re.sub(r"\s+", " ", q2).strip()
-        return q2
+    missing_qs = []
 
-    bayut_set = {q_key(q) for q in bayut_qs if q}
+    for cp in comp_pairs:
+        q = clean(cp.get("question", ""))
+        if not q:
+            continue
 
-    missing_qs = [q for q in comp_qs if q_key(q) not in bayut_set]
+        matched = False
+        for bp in bayut_pairs:
+            bq = clean(bp.get("question", ""))
+            if not bq:
+                continue
+            if faq_questions_equivalent(q, bq):
+                matched = True
+                break
+        if matched:
+            continue
+
+        # Ignore weak overlaps; only mark a gap when no equivalent/related FAQ question exists.
+        if bayut_pairs and any(faq_questions_related(q, clean(bp.get("question", ""))) for bp in bayut_pairs):
+            continue
+
+        missing_qs.append(q)
+
+    dedup_missing: List[str] = []
+    seen = set()
+    for q in missing_qs:
+        k = norm_header(normalize_question(q))
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        dedup_missing.append(q)
+    missing_qs = dedup_missing
+
     if not missing_qs:
         return None
 
-    def as_question_list(items: List[str]) -> str:
+    def as_question_list(items: List[str], label: str = "") -> str:
         cleaned = [clean(i) for i in items if clean(i)]
         if not cleaned:
             return ""
         parts = [f"{idx + 1}-{html_lib.escape(q)}" for idx, q in enumerate(cleaned)]
-        return "<div>" + " ".join(parts) + "</div>"
+        body = "<div>" + " ".join(parts) + "</div>"
+        if label:
+            return f"<div>{html_lib.escape(label)}</div>" + body
+        return body
+
+    desc_parts = []
+    if missing_qs:
+        desc_parts.append(as_question_list(missing_qs, label="Missing FAQ questions:"))
 
     return {
         "Headers": "FAQs",
-        "Description": as_question_list(missing_qs),
+        "Description": "".join(desc_parts).strip(),
         "Source": source_link(comp_url),
     }
 
@@ -1597,11 +2121,30 @@ def header_similarity(a: str, b: str) -> float:
     b_n = norm_header(b)
     if not a_n or not b_n:
         return 0.0
+
     a_set = set(a_n.split())
     b_set = set(b_n.split())
     jacc = len(a_set & b_set) / max(len(a_set | b_set), 1) if a_set and b_set else 0.0
     seq = SequenceMatcher(None, a_n, b_n).ratio()
-    return (0.55 * seq) + (0.45 * jacc)
+    base = (0.55 * seq) + (0.45 * jacc)
+
+    # Extra semantic tolerance for cosmetic variants:
+    # "The Light Village" ~ "About Sharjah Light Village".
+    a_core = set(_header_core_tokens(a))
+    b_core = set(_header_core_tokens(b))
+    if not a_core or not b_core:
+        return base
+
+    core_jacc = len(a_core & b_core) / max(len(a_core | b_core), 1)
+    core_seq = SequenceMatcher(None, " ".join(sorted(a_core)), " ".join(sorted(b_core))).ratio()
+    core_score = (0.60 * core_seq) + (0.40 * core_jacc)
+
+    subset_bonus = 0.0
+    smallest = min(len(a_core), len(b_core))
+    if 2 <= smallest <= 3 and (a_core.issubset(b_core) or b_core.issubset(a_core)):
+        subset_bonus = 0.84
+
+    return max(base, core_score, subset_bonus)
 
 def find_best_bayut_match(comp_header: str, bayut_sections: List[dict], min_score: float = 0.73) -> Optional[dict]:
     best = None
@@ -1735,14 +2278,14 @@ def update_mode_rows_header_first(
             if p not in rows_map[key]["DescriptionParts"]:
                 rows_map[key]["DescriptionParts"].append(p)
 
-    def children_map(h3_list: List[dict]) -> Dict[str, List[dict]]:
+    def children_map(child_sections: List[dict]) -> Dict[str, List[dict]]:
         cmap: Dict[str, List[dict]] = {}
-        for h3 in h3_list:
-            parent = h3.get("parent_h2") or ""
+        for sec in child_sections:
+            parent = sec.get("parent_h2") or ""
             pk = norm_header(parent)
             if not pk:
                 continue
-            cmap.setdefault(pk, []).append(h3)
+            cmap.setdefault(pk, []).append(sec)
         return cmap
 
     def child_headers(cmap: Dict[str, List[dict]], parent_header: str) -> List[str]:
@@ -1759,11 +2302,30 @@ def update_mode_rows_header_first(
         child_content = " ".join(c.get("content", "") for c in cmap.get(pk, []))
         return clean(" ".join([h2_content, child_content]))
 
-    def missing_children(comp_children: List[str], bayut_children: List[str]) -> List[str]:
+    def missing_children(
+        comp_children: List[str],
+        bayut_children: List[str],
+        bayut_text: str,
+        bayut_global_text: str,
+    ) -> List[str]:
         missing = []
+        child_section_objs = [{"header": h} for h in bayut_children if clean(h)]
         for ch in comp_children:
-            if not any(header_similarity(ch, bh) >= 0.73 for bh in bayut_children):
-                missing.append(ch)
+            if HIGH_PRECISION_MODE and _is_low_signal_subtopic(ch):
+                continue
+            if _topic_is_covered(ch, child_section_objs, bayut_text, min_header_score=0.73, min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE):
+                continue
+            if _subtopic_covered_in_text(ch, bayut_text):
+                continue
+            if HIGH_PRECISION_MODE:
+                cov_all = _topic_coverage_ratio(ch, bayut_global_text)
+                toks = _header_core_tokens(ch)
+                if toks:
+                    if len(toks) <= 2 and cov_all >= 1.0:
+                        continue
+                    if len(toks) > 2 and cov_all >= MISSING_SUBTOPIC_MIN_TEXT_COVERAGE:
+                        continue
+            missing.append(ch)
         return missing
 
     def depth_gap_summary(comp_text: str, bayut_text: str) -> str:
@@ -1779,16 +2341,17 @@ def update_mode_rows_header_first(
             return ""
         return summarize_content_gap_action("", c_txt, b_txt)
 
-    bayut_secs = section_nodes(bayut_nodes, levels=(2, 3))
-    comp_secs = section_nodes(comp_nodes, levels=(2, 3))
+    bayut_secs = section_nodes(bayut_nodes, levels=(2, 3, 4))
+    comp_secs = section_nodes(comp_nodes, levels=(2, 3, 4))
 
     bayut_h2 = [s for s in bayut_secs if s["level"] == 2]
-    bayut_h3 = [s for s in bayut_secs if s["level"] == 3]
+    bayut_child_sections = [s for s in bayut_secs if s["level"] >= 3]
     comp_h2 = [s for s in comp_secs if s["level"] == 2]
-    comp_h3 = [s for s in comp_secs if s["level"] == 3]
+    comp_children_all = [s for s in comp_secs if s["level"] >= 3]
 
-    bayut_children_map = children_map(bayut_h3)
-    comp_children_map = children_map(comp_h3)
+    bayut_children_map = children_map(bayut_child_sections)
+    comp_children_map = children_map(comp_children_all)
+    bayut_global_text = _coverage_corpus(bayut_fr, bayut_nodes)
 
     for cs in comp_h2:
         comp_header = cs.get("header", "")
@@ -1797,13 +2360,22 @@ def update_mode_rows_header_first(
 
         m = find_best_bayut_match(comp_header, bayut_h2, min_score=0.73)
         if not m:
+            if HIGH_PRECISION_MODE and _topic_is_covered(
+                comp_header,
+                bayut_h2 + bayut_child_sections,
+                bayut_global_text,
+                min_header_score=0.73,
+                min_text_coverage=MISSING_HEADER_MIN_TEXT_COVERAGE,
+            ):
+                continue
             desc = summarize_missing_section_action(comp_header, comp_children, comp_text)
             add_row(comp_header, [desc])
             continue
 
         bayut_header = m["bayut_section"]["header"]
-        bayut_children = child_headers(bayut_children_map, bayut_header)
-        missing_sub = missing_children(comp_children, bayut_children)
+        bayut_child_headers = child_headers(bayut_children_map, bayut_header)
+        bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
+        missing_sub = missing_children(comp_children, bayut_child_headers, bayut_text, bayut_global_text)
 
         parts = []
         if missing_sub:
@@ -1811,7 +2383,6 @@ def update_mode_rows_header_first(
             if sub_list:
                 parts.append(f"Missing subtopics: {sub_list}.")
 
-        bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
         depth_note = depth_gap_summary(comp_text, bayut_text)
         if depth_note:
             parts.append(depth_note)
@@ -1820,12 +2391,20 @@ def update_mode_rows_header_first(
             add_row(comp_header, parts)
 
     comp_h2_norms = {norm_header(h.get("header", "")) for h in comp_h2}
-    for cs in comp_h3:
+    for cs in comp_children_all:
         parent = cs.get("parent_h2") or ""
         if parent and norm_header(parent) in comp_h2_norms:
             continue
-        m = find_best_bayut_match(cs["header"], bayut_h3 + bayut_h2, min_score=0.73)
+        m = find_best_bayut_match(cs["header"], bayut_child_sections + bayut_h2, min_score=0.73)
         if m:
+            continue
+        if HIGH_PRECISION_MODE and _topic_is_covered(
+            cs["header"],
+            bayut_child_sections + bayut_h2,
+            bayut_global_text,
+            min_header_score=0.73,
+            min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
+        ):
             continue
         desc = summarize_missing_section_action(cs["header"], None, cs.get("content", ""))
         add_row(cs["header"], [desc])
@@ -4299,20 +4878,37 @@ if st.session_state.mode == "update":
             st.error("Add at least one competitor URL.")
             st.stop()
 
-        with st.spinner("Fetching Bayut (no exceptions)…"):
+        with st.spinner("Fetching Bayut…"):
             bayut_fr_map = resolve_all_or_require_manual(agent, [bayut_url.strip()], st_key_prefix="bayut")
-            bayut_tree_map = ensure_headings_or_require_repaste([bayut_url.strip()], bayut_fr_map, st_key_prefix="bayut_tree")
         bayut_fr = bayut_fr_map[bayut_url.strip()]
+        if not bayut_fr.ok:
+            st.warning("Bayut URL appears protected/blocked and could not be fetched automatically.")
+            st.stop()
+        bayut_tree_map = ensure_headings_or_require_repaste([bayut_url.strip()], bayut_fr_map, st_key_prefix="bayut_tree")
         bayut_nodes = bayut_tree_map[bayut_url.strip()]["nodes"]
 
-        with st.spinner("Fetching ALL competitors (no exceptions)…"):
+        with st.spinner("Fetching competitors…"):
             comp_fr_map = resolve_all_or_require_manual(agent, competitors, st_key_prefix="comp_update")
-            comp_tree_map = ensure_headings_or_require_repaste(competitors, comp_fr_map, st_key_prefix="comp_update_tree")
+        usable_competitors, skipped_competitors = split_fetch_results(competitors, comp_fr_map)
+        if skipped_competitors and usable_competitors:
+            st.info(
+                f"Skipped {len(skipped_competitors)} protected/unfetchable competitor URL(s) and continued "
+                f"with {len(usable_competitors)}."
+            )
+        if not usable_competitors:
+            if len(competitors) == 1:
+                st.warning("The competitor website is protected/blocked and could not be fetched automatically.")
+            else:
+                st.warning("All competitor websites were protected/blocked or unreachable, so there is nothing to analyze.")
+            st.stop()
+        comp_tree_map = ensure_headings_or_require_repaste(
+            usable_competitors, comp_fr_map, st_key_prefix="comp_update_tree"
+        )
 
         all_rows = []
         internal_fetch = []
 
-        for comp_url in competitors:
+        for comp_url in usable_competitors:
             src = comp_fr_map[comp_url].source
             internal_fetch.append((comp_url, f"ok ({src})"))
             comp_nodes = comp_tree_map[comp_url]["nodes"]
@@ -4324,6 +4920,8 @@ if st.session_state.mode == "update":
                 comp_fr=comp_fr_map[comp_url],
                 comp_url=comp_url,
             ))
+        for comp_url in skipped_competitors:
+            internal_fetch.append((comp_url, f"skipped ({fetch_failure_label(comp_fr_map.get(comp_url))})"))
 
         st.session_state.update_fetch = internal_fetch
         st.session_state.update_df = (
@@ -4336,7 +4934,7 @@ if st.session_state.mode == "update":
             bayut_url=bayut_url.strip(),
             bayut_fr=bayut_fr,
             bayut_nodes=bayut_nodes,
-            competitors=competitors,
+            competitors=usable_competitors,
             comp_fr_map=comp_fr_map,
             comp_tree_map=comp_tree_map,
             manual_fkw=manual_fkw_update.strip()
@@ -4349,8 +4947,8 @@ if st.session_state.mode == "update":
 
         st.session_state.cq_update_df = build_content_quality_table_from_seo(
             seo_df=st.session_state.seo_update_df,
-            fr_map_by_url={bayut_url.strip(): bayut_fr, **comp_fr_map},
-            tree_map_by_url={bayut_url.strip(): {"nodes": bayut_nodes}, **{u: comp_tree_map[u] for u in competitors}},
+            fr_map_by_url={bayut_url.strip(): bayut_fr, **{u: comp_fr_map[u] for u in usable_competitors}},
+            tree_map_by_url={bayut_url.strip(): {"nodes": bayut_nodes}, **{u: comp_tree_map[u] for u in usable_competitors}},
             manual_query=manual_fkw_update.strip(),
             manual_query_secondary=manual_fkw2_update.strip()
         )
@@ -4359,7 +4957,7 @@ if st.session_state.mode == "update":
         st.session_state.ai_vis_update_df = build_ai_visibility_table(
             query=query_for_ai,
             target_url=bayut_url.strip(),
-            competitors=competitors,
+            competitors=usable_competitors,
             device="mobile",
         )
 
@@ -4452,18 +5050,34 @@ else:
             st.error("Add at least one competitor URL.")
             st.stop()
 
-        with st.spinner("Fetching ALL competitors (no exceptions)…"):
+        with st.spinner("Fetching competitors…"):
             comp_fr_map = resolve_all_or_require_manual(agent, competitors, st_key_prefix="comp_new")
-            comp_tree_map = ensure_headings_or_require_repaste(competitors, comp_fr_map, st_key_prefix="comp_new_tree")
+        usable_competitors, skipped_competitors = split_fetch_results(competitors, comp_fr_map)
+        if skipped_competitors and usable_competitors:
+            st.info(
+                f"Skipped {len(skipped_competitors)} protected/unfetchable competitor URL(s) and continued "
+                f"with {len(usable_competitors)}."
+            )
+        if not usable_competitors:
+            if len(competitors) == 1:
+                st.warning("The competitor website is protected/blocked and could not be fetched automatically.")
+            else:
+                st.warning("All competitor websites were protected/blocked or unreachable, so there is nothing to analyze.")
+            st.stop()
+        comp_tree_map = ensure_headings_or_require_repaste(
+            usable_competitors, comp_fr_map, st_key_prefix="comp_new_tree"
+        )
 
         rows = []
         internal_fetch = []
 
-        for comp_url in competitors:
+        for comp_url in usable_competitors:
             src = comp_fr_map[comp_url].source
             internal_fetch.append((comp_url, f"ok ({src})"))
             comp_nodes = comp_tree_map[comp_url]["nodes"]
             rows.extend(new_post_coverage_rows(comp_nodes, comp_url))
+        for comp_url in skipped_competitors:
+            internal_fetch.append((comp_url, f"skipped ({fetch_failure_label(comp_fr_map.get(comp_url))})"))
 
         st.session_state.new_fetch = internal_fetch
         st.session_state.new_df = (
@@ -4474,7 +5088,7 @@ else:
 
         st.session_state.seo_new_df = build_seo_analysis_newpost(
             new_title=new_title.strip(),
-            competitors=competitors,
+            competitors=usable_competitors,
             comp_fr_map=comp_fr_map,
             comp_tree_map=comp_tree_map,
             manual_fkw=manual_fkw_new.strip()
@@ -4487,8 +5101,8 @@ else:
 
         st.session_state.cq_new_df = build_content_quality_table_from_seo(
             seo_df=st.session_state.seo_new_df,
-            fr_map_by_url={u: comp_fr_map[u] for u in competitors},
-            tree_map_by_url={u: comp_tree_map[u] for u in competitors},
+            fr_map_by_url={u: comp_fr_map[u] for u in usable_competitors},
+            tree_map_by_url={u: comp_tree_map[u] for u in usable_competitors},
             manual_query=manual_fkw_new.strip(),
             manual_query_secondary=manual_fkw2_new.strip()
         )
@@ -4497,7 +5111,7 @@ else:
         st.session_state.ai_vis_new_df = build_ai_visibility_table(
             query=query_for_ai,
             target_url="Not applicable",
-            competitors=competitors,
+            competitors=usable_competitors,
             device="mobile",
         )
 
