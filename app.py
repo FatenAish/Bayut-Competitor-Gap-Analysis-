@@ -1701,7 +1701,9 @@ def faq_question_covered_in_text(q: str, bayut_text: str) -> bool:
     ratio = overlap / max(len(q_tokens), 1)
     if len(q_tokens) <= 2:
         return ratio >= 1.0
-    return ratio >= 0.70
+    if len(q_tokens) == 3:
+        return ratio >= 0.85
+    return ratio >= 0.80
 
 def faq_topics_from_questions(questions: List[str], limit: int = 10) -> List[str]:
     out: List[str] = []
@@ -1783,14 +1785,15 @@ def missing_faqs_row(
     for q in comp_qs:
         if any(faq_questions_equivalent(q, bq) for bq in bayut_qs):
             continue
-        if HIGH_PRECISION_MODE and faq_topic_covered_in_text(q, bayut_corpus):
+        # Do not hide FAQ gaps aggressively when Bayut has no real FAQ block.
+        if HIGH_PRECISION_MODE and bayut_has and faq_topic_covered_in_text(q, bayut_corpus):
             continue
-        if HIGH_PRECISION_MODE and faq_question_covered_in_text(q, bayut_corpus):
+        if HIGH_PRECISION_MODE and bayut_has and faq_question_covered_in_text(q, bayut_corpus):
             continue
         missing_qs.append(q)
 
     # In strict mode, allow a single FAQ gap only when it's clearly missing.
-    if HIGH_PRECISION_MODE and len(missing_qs) == 1:
+    if HIGH_PRECISION_MODE and bayut_has and len(missing_qs) == 1:
         only_q = missing_qs[0]
         only_topic = faq_topic_from_question(only_q)
         topic_cov = _topic_coverage_ratio(only_topic, bayut_corpus) if only_topic else 0.0
