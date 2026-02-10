@@ -772,8 +772,15 @@ class FetchAgent:
 
         # Remove recurring non-content wrappers before extracting text.
         for el in list(soup.find_all(True)):
-            cls = " ".join(el.get("class", []) or []).lower()
-            el_id = (el.get("id") or "").lower()
+            attrs = getattr(el, "attrs", None)
+            if not isinstance(attrs, dict):
+                continue
+            cls_raw = attrs.get("class", [])
+            if isinstance(cls_raw, (list, tuple, set)):
+                cls = " ".join(str(x) for x in cls_raw if x is not None).lower()
+            else:
+                cls = str(cls_raw or "").lower()
+            el_id = str(attrs.get("id", "") or "").lower()
             if any(tok in cls or tok in el_id for tok in NONCONTENT_TOKENS):
                 el.decompose()
 
