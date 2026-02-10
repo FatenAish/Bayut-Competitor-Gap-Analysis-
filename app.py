@@ -2008,63 +2008,44 @@ def missing_faqs_row(
     if not comp_pairs:
         return None
 
-    bayut_has = page_has_real_faq(bayut_fr, bayut_nodes)
-    bayut_pairs = []
-    if bayut_has:
-        bayut_pairs = extract_faq_pairs(bayut_fr, bayut_nodes)
+    bayut_pairs = extract_faq_pairs(bayut_fr, bayut_nodes) if page_has_real_faq(bayut_fr, bayut_nodes) else []
     bayut_pairs = [p for p in bayut_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
-    bayut_corpus = _coverage_corpus(bayut_fr, bayut_nodes)
 
     missing_qs = []
-    related_qs = []
-    conflicts = []
 
     for cp in comp_pairs:
         q = clean(cp.get("question", ""))
-        comp_answer = clean(cp.get("answer", ""))
         if not q:
             continue
 
-        matched = None
-        best_score = 0.0
+        matched = False
         for bp in bayut_pairs:
             bq = clean(bp.get("question", ""))
             if not bq:
                 continue
-            if not faq_questions_equivalent(q, bq):
-                continue
-            sc = header_similarity(faq_topic_from_question(q), faq_topic_from_question(bq))
-            if sc > best_score:
-                best_score = sc
-                matched = bp
-
+            if faq_questions_equivalent(q, bq):
+                matched = True
+                break
         if matched:
-            bayut_answer = clean(matched.get("answer", ""))
-            if faq_answers_conflict(q, comp_answer, bayut_answer):
-                c_dates = ", ".join(sorted(_extract_date_signatures(comp_answer))) or "not detected"
-                b_dates = ", ".join(sorted(_extract_date_signatures(bayut_answer))) or "not detected"
-                conflicts.append(f"{q} (Competitor: {c_dates}; Bayut: {b_dates})")
             continue
 
+        # Ignore weak overlaps; only mark a gap when no equivalent/related FAQ question exists.
         if bayut_pairs and any(faq_questions_related(q, clean(bp.get("question", ""))) for bp in bayut_pairs):
-            related_qs.append(q)
             continue
 
-        # Do not hide FAQ gaps aggressively when Bayut has no real FAQ block.
-        if HIGH_PRECISION_MODE and bayut_has and faq_topic_covered_in_text(q, bayut_corpus):
-            continue
-        if HIGH_PRECISION_MODE and bayut_has and faq_question_covered_in_text(q, bayut_corpus):
-            continue
         missing_qs.append(q)
 
-    # In strict mode, allow a single FAQ gap only when it's clearly missing.
-    if HIGH_PRECISION_MODE and bayut_has and len(missing_qs) == 1 and not conflicts:
-        only_q = missing_qs[0]
-        only_topic = faq_topic_from_question(only_q)
-        topic_cov = _topic_coverage_ratio(only_topic, bayut_corpus) if only_topic else 0.0
-        if topic_cov >= SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE:
-            return None
-    if not missing_qs and not conflicts:
+    dedup_missing: List[str] = []
+    seen = set()
+    for q in missing_qs:
+        k = norm_header(normalize_question(q))
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        dedup_missing.append(q)
+    missing_qs = dedup_missing
+
+    if not missing_qs:
         return None
 
     def as_question_list(items: List[str], label: str = "") -> str:
@@ -2079,13 +2060,7 @@ def missing_faqs_row(
 
     desc_parts = []
     if missing_qs:
-        desc_parts.append(as_question_list(missing_qs, label="Missing FAQ intents:"))
-    if conflicts:
-        desc_parts.append(as_question_list(conflicts, label="Potential answer conflicts on matched FAQ intents:"))
-    if related_qs and not missing_qs:
-        rel_txt = format_gap_list(related_qs, limit=2)
-        if rel_txt:
-            desc_parts.append(f"<div>Related (partial overlap): {html_lib.escape(rel_txt)}.</div>")
+        desc_parts.append(as_question_list(missing_qs, label="Missing FAQ questions:"))
 
     return {
         "Headers": "FAQs",
