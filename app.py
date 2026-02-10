@@ -908,6 +908,12 @@ GENERIC_STOP = {
     "property","properties","rent","sale","apartments","villas","guide"
 }
 
+# Conservative defaults: prefer suppressing uncertain gaps over false positives.
+HIGH_PRECISION_MODE = True
+MISSING_HEADER_MIN_TEXT_COVERAGE = 0.90
+MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.88
+MISSING_FAQ_MIN_TEXT_COVERAGE = 0.85
+
 def norm_header(h: str) -> str:
     h = clean(h).lower()
     h = re.sub(r"[^a-z0-9\s]", "", h)
@@ -941,6 +947,16 @@ FAQ_FILLER_TOKENS = {
     "faq", "faqs", "question", "questions", "attend", "attendance", "visitor", "visitors",
     "visit", "visiting",
 }
+
+def _token_aliases(tok: str) -> set:
+    stem = _stem_token(tok)
+    aliases = {stem}
+    for key, vals in SUBTOPIC_TOKEN_ALIASES.items():
+        bucket = {_stem_token(key)} | {_stem_token(v) for v in vals}
+        if stem in bucket:
+            aliases |= bucket
+            break
+    return aliases
 
 def _header_core_tokens(text: str) -> List[str]:
     out = []
@@ -981,14 +997,71 @@ def _subtopic_covered_in_text(subtopic: str, bayut_text: str) -> bool:
         return False
 
     def token_hit(tok: str) -> bool:
-        aliases = {_stem_token(tok)}
-        aliases |= {_stem_token(a) for a in SUBTOPIC_TOKEN_ALIASES.get(_stem_token(tok), set())}
-        return bool(text_tokens & aliases)
+        return bool(text_tokens & _token_aliases(tok))
 
     hits = sum(1 for tok in sub_tokens if token_hit(tok))
     if len(sub_tokens) <= 2:
         return hits >= 1
     return hits >= 2
+
+def _topic_coverage_ratio(topic: str, text: str) -> float:
+    topic_tokens = _header_core_tokens(topic)
+    if not topic_tokens:
+        return 0.0
+    text_tokens = set(_tokenize_norm_words(text or ""))
+    if not text_tokens:
+        return 0.0
+    hits = 0
+    for tok in topic_tokens:
+        if text_tokens & _token_aliases(tok):
+            hits += 1
+    return hits / max(len(topic_tokens), 1)
+
+def _topic_is_covered(
+    topic: str,
+    bayut_sections: List[dict],
+    bayut_text: str,
+    min_header_score: float = 0.73,
+    min_text_coverage: float = 0.90,
+) -> bool:
+    t = clean(topic or "")
+    if not t:
+        return True
+
+    best_header = 0.0
+    for sec in bayut_sections or []:
+        h = clean(sec.get("header", ""))
+        if not h:
+            continue
+        best_header = max(best_header, header_similarity(t, h))
+    if best_header >= min_header_score:
+        return True
+
+    text_n = norm_header(bayut_text or "")
+    topic_n = norm_header(t)
+    if topic_n and len(topic_n) >= 14 and topic_n in text_n:
+        return True
+
+    coverage = _topic_coverage_ratio(t, bayut_text)
+    toks = _header_core_tokens(t)
+    if not toks:
+        return False
+    if len(toks) <= 2:
+        return coverage >= 1.0
+    return coverage >= min_text_coverage
+
+def _coverage_corpus(fr: FetchResult, nodes: List[dict]) -> str:
+    parts = []
+    if fr and fr.text:
+        parts.append(fr.text)
+    for x in flatten(nodes or []):
+        h = clean(x.get("header", ""))
+        c = clean(x.get("content", ""))
+        if h:
+            parts.append(h)
+        if c:
+            parts.append(c)
+    return clean(" ".join(parts))
 
 def header_is_faq(header: str) -> bool:
     nh = norm_header(header)
@@ -1559,6 +1632,18 @@ def faq_topic_from_question(q: str) -> str:
         return ""
     return topic[:1].upper() + topic[1:]
 
+def faq_topic_covered_in_text(q: str, bayut_text: str) -> bool:
+    topic = faq_topic_from_question(q)
+    if not topic:
+        return False
+    cov = _topic_coverage_ratio(topic, bayut_text)
+    toks = _header_core_tokens(topic)
+    if not toks:
+        return False
+    if len(toks) <= 2:
+        return cov >= 1.0
+    return cov >= MISSING_FAQ_MIN_TEXT_COVERAGE
+
 def faq_topics_from_questions(questions: List[str], limit: int = 10) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -1633,10 +1718,13 @@ def missing_faqs_row(
     if bayut_has:
         bayut_qs = extract_faq_questions(bayut_fr, bayut_nodes)
     bayut_qs = [q for q in bayut_qs if q and len(q) > 5]
+    bayut_corpus = _coverage_corpus(bayut_fr, bayut_nodes)
 
     missing_qs = []
     for q in comp_qs:
         if any(faq_questions_equivalent(q, bq) for bq in bayut_qs):
+            continue
+        if HIGH_PRECISION_MODE and faq_topic_covered_in_text(q, bayut_corpus):
             continue
         missing_qs.append(q)
     if not missing_qs:
@@ -1889,13 +1977,27 @@ def update_mode_rows_header_first(
         child_content = " ".join(c.get("content", "") for c in cmap.get(pk, []))
         return clean(" ".join([h2_content, child_content]))
 
-    def missing_children(comp_children: List[str], bayut_children: List[str], bayut_text: str) -> List[str]:
+    def missing_children(
+        comp_children: List[str],
+        bayut_children: List[str],
+        bayut_text: str,
+        bayut_global_text: str,
+    ) -> List[str]:
         missing = []
+        child_section_objs = [{"header": h} for h in bayut_children if clean(h)]
         for ch in comp_children:
-            if any(header_similarity(ch, bh) >= 0.73 for bh in bayut_children):
+            if _topic_is_covered(ch, child_section_objs, bayut_text, min_header_score=0.73, min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE):
                 continue
             if _subtopic_covered_in_text(ch, bayut_text):
                 continue
+            if HIGH_PRECISION_MODE:
+                cov_all = _topic_coverage_ratio(ch, bayut_global_text)
+                toks = _header_core_tokens(ch)
+                if toks:
+                    if len(toks) <= 2 and cov_all >= 1.0:
+                        continue
+                    if len(toks) > 2 and cov_all >= MISSING_SUBTOPIC_MIN_TEXT_COVERAGE:
+                        continue
             missing.append(ch)
         return missing
 
@@ -1922,6 +2024,7 @@ def update_mode_rows_header_first(
 
     bayut_children_map = children_map(bayut_child_sections)
     comp_children_map = children_map(comp_children_all)
+    bayut_global_text = _coverage_corpus(bayut_fr, bayut_nodes)
 
     for cs in comp_h2:
         comp_header = cs.get("header", "")
@@ -1930,6 +2033,14 @@ def update_mode_rows_header_first(
 
         m = find_best_bayut_match(comp_header, bayut_h2, min_score=0.73)
         if not m:
+            if HIGH_PRECISION_MODE and _topic_is_covered(
+                comp_header,
+                bayut_h2 + bayut_child_sections,
+                bayut_global_text,
+                min_header_score=0.73,
+                min_text_coverage=MISSING_HEADER_MIN_TEXT_COVERAGE,
+            ):
+                continue
             desc = summarize_missing_section_action(comp_header, comp_children, comp_text)
             add_row(comp_header, [desc])
             continue
@@ -1937,7 +2048,7 @@ def update_mode_rows_header_first(
         bayut_header = m["bayut_section"]["header"]
         bayut_child_headers = child_headers(bayut_children_map, bayut_header)
         bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
-        missing_sub = missing_children(comp_children, bayut_child_headers, bayut_text)
+        missing_sub = missing_children(comp_children, bayut_child_headers, bayut_text, bayut_global_text)
 
         parts = []
         if missing_sub:
@@ -1959,6 +2070,14 @@ def update_mode_rows_header_first(
             continue
         m = find_best_bayut_match(cs["header"], bayut_child_sections + bayut_h2, min_score=0.73)
         if m:
+            continue
+        if HIGH_PRECISION_MODE and _topic_is_covered(
+            cs["header"],
+            bayut_child_sections + bayut_h2,
+            bayut_global_text,
+            min_header_score=0.73,
+            min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
+        ):
             continue
         desc = summarize_missing_section_action(cs["header"], None, cs.get("content", ""))
         add_row(cs["header"], [desc])
