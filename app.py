@@ -1410,6 +1410,20 @@ def get_first_h1(nodes: List[dict]) -> str:
 # STRICT FAQ DETECTION (REAL FAQ ONLY)
 # =====================================================
 FAQ_TITLES = {"faq","faqs","frequently asked questions","frequently asked question"}
+MONTH_NAME_TO_NUM = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
 
 def _looks_like_question(s: str) -> bool:
     s = clean(s)
@@ -1562,6 +1576,129 @@ def _faq_questions_from_html(html: str) -> List[str]:
         out.append(q)
     return out
 
+def _faq_pairs_from_schema(html: str) -> List[dict]:
+    if not html:
+        return []
+    out: List[dict] = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        scripts = soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)})
+        for s in scripts:
+            raw = (s.string or s.get_text(" ") or "").strip()
+            if not raw:
+                continue
+            try:
+                j = json.loads(raw)
+            except Exception:
+                continue
+
+            def _add_pair(q: str, a: str = ""):
+                qn = normalize_question(q)
+                an = clean(re.sub(r"<[^>]+>", " ", str(a or "")))
+                if not qn or len(qn) < 6 or len(qn) > 180:
+                    return
+                out.append({"question": qn, "answer": an})
+
+            def _walk(x):
+                if isinstance(x, dict):
+                    t = x.get("@type") or x.get("type")
+                    t_list = []
+                    if isinstance(t, list):
+                        t_list = [str(z).lower() for z in t]
+                    elif isinstance(t, str):
+                        t_list = [t.lower()]
+
+                    if any("question" == z or z.endswith("question") for z in t_list):
+                        q = x.get("name") or x.get("text") or ""
+                        a = ""
+                        ans_obj = x.get("acceptedAnswer") or x.get("answer") or {}
+                        if isinstance(ans_obj, dict):
+                            a = ans_obj.get("text") or ans_obj.get("name") or ""
+                        elif isinstance(ans_obj, str):
+                            a = ans_obj
+                        if q:
+                            _add_pair(q, a)
+                    for v in x.values():
+                        _walk(v)
+                elif isinstance(x, list):
+                    for v in x:
+                        _walk(v)
+
+            _walk(j)
+    except Exception:
+        return []
+
+    dedup: Dict[str, dict] = {}
+    for p in out:
+        k = norm_header(p.get("question", ""))
+        if not k:
+            continue
+        if k not in dedup:
+            dedup[k] = p
+            continue
+        # Prefer richer answer text when duplicate questions appear.
+        if len(clean(p.get("answer", ""))) > len(clean(dedup[k].get("answer", ""))):
+            dedup[k] = p
+    return list(dedup.values())
+
+def _faq_pairs_from_html(html: str) -> List[dict]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup.find_all(list(IGNORE_TAGS)):
+        t.decompose()
+
+    pairs: List[dict] = []
+    pairs.extend(_faq_pairs_from_schema(html))
+
+    candidates = []
+    for tag in soup.find_all(True):
+        id_attr = (tag.get("id") or "").lower()
+        cls_attr = " ".join(tag.get("class", []) or []).lower()
+        if re.search(r"\bfaq\b|\bfaqs\b|\baccordion\b|\bquestions\b", id_attr + " " + cls_attr):
+            candidates.append(tag)
+
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+        if header_is_faq(h.get_text(" ")):
+            candidates.append(h.parent or h)
+
+    for c in candidates[:10]:
+        pending_q = ""
+        pending_idx = -1
+        for el in c.find_all(["summary", "button", "h3", "h4", "h5", "strong", "p", "li", "dt", "dd"]):
+            txt = clean(el.get_text(" "))
+            if not txt or len(txt) < 6:
+                continue
+            if len(txt) > 320:
+                continue
+            if _looks_like_question(txt):
+                qn = normalize_question(txt)
+                if qn:
+                    pairs.append({"question": qn, "answer": ""})
+                    pending_q = qn
+                    pending_idx = len(pairs) - 1
+                continue
+            if pending_q and pending_idx >= 0 and pending_idx < len(pairs):
+                # First nearby non-question block after question acts as answer.
+                if not pairs[pending_idx].get("answer", ""):
+                    pairs[pending_idx]["answer"] = txt
+
+    dedup: Dict[str, dict] = {}
+    for p in pairs:
+        q = clean(p.get("question", ""))
+        if not q:
+            continue
+        k = norm_header(q)
+        if not k:
+            continue
+        a = clean(p.get("answer", ""))
+        if k not in dedup:
+            dedup[k] = {"question": q, "answer": a}
+            continue
+        if len(a) > len(clean(dedup[k].get("answer", ""))):
+            dedup[k]["answer"] = a
+    return list(dedup.values())
+
 def _faq_heading_nodes(nodes: List[dict]) -> List[dict]:
     out = []
     for x in flatten(nodes):
@@ -1642,6 +1779,44 @@ def extract_faq_questions(fr: FetchResult, nodes: List[dict]) -> List[str]:
         seen.add(k)
         out.append(q)
     return out
+
+def _faq_pairs_from_nodes(nodes: List[dict]) -> List[dict]:
+    pairs: List[dict] = []
+    for fn in _faq_heading_nodes(nodes):
+        for c in fn.get("children", []) or []:
+            q = clean(c.get("header", ""))
+            if not q or not _looks_like_question(q):
+                continue
+            a = clean(c.get("content", ""))
+            pairs.append({"question": normalize_question(q), "answer": a})
+    return pairs
+
+def extract_faq_pairs(fr: FetchResult, nodes: List[dict]) -> List[dict]:
+    pairs: List[dict] = []
+    if fr and fr.html:
+        pairs.extend(_faq_pairs_from_html(fr.html))
+    pairs.extend(_faq_pairs_from_nodes(nodes))
+
+    # Backfill questions without answers from question-only extraction.
+    q_only = extract_faq_questions(fr, nodes)
+    for q in q_only:
+        pairs.append({"question": normalize_question(q), "answer": ""})
+
+    dedup: Dict[str, dict] = {}
+    for p in pairs:
+        q = clean(p.get("question", ""))
+        if not q:
+            continue
+        k = norm_header(q)
+        if not k:
+            continue
+        a = clean(p.get("answer", ""))
+        if k not in dedup:
+            dedup[k] = {"question": q, "answer": a}
+            continue
+        if len(a) > len(clean(dedup[k].get("answer", ""))):
+            dedup[k]["answer"] = a
+    return list(dedup.values())
 
 def faq_topic_from_question(q: str) -> str:
     raw = normalize_question(q)
@@ -1759,6 +1934,68 @@ def faq_questions_equivalent(a: str, b: str) -> bool:
 
     return SequenceMatcher(None, a_n, b_n).ratio() >= 0.90
 
+def faq_questions_related(a: str, b: str) -> bool:
+    if faq_questions_equivalent(a, b):
+        return True
+    a_topic = faq_topic_from_question(a)
+    b_topic = faq_topic_from_question(b)
+    if a_topic and b_topic and header_similarity(a_topic, b_topic) >= 0.64:
+        return True
+
+    a_tokens = set(_faq_core_tokens(a))
+    b_tokens = set(_faq_core_tokens(b))
+    if not a_tokens or not b_tokens:
+        return False
+
+    overlap = a_tokens & b_tokens
+    if len(overlap) >= 2:
+        return True
+    anchor = overlap & {
+        "restaurant", "menu", "reservation", "book", "booking",
+        "event", "festival", "ticket", "free", "location",
+        "date", "time", "year", "global", "village",
+    }
+    if anchor:
+        return True
+    return False
+
+def _question_has_date_intent(q: str) -> bool:
+    qn = norm_header(normalize_question(q))
+    if not qn:
+        return False
+    return any(tok in qn for tok in ["when", "date", "day", "month", "year", "start", "begin"])
+
+def _extract_date_signatures(text: str) -> set:
+    t = clean(text or "").lower()
+    if not t:
+        return set()
+    out = set()
+    month_rgx = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+
+    for m in re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{month_rgx}\s+(\d{{4}})\b", t, flags=re.I):
+        day = int(m.group(1))
+        mon = MONTH_NAME_TO_NUM.get(m.group(2).lower(), 0)
+        year = int(m.group(3))
+        if mon and 1 <= day <= 31:
+            out.add(f"{year:04d}-{mon:02d}-{day:02d}")
+
+    for m in re.finditer(rf"\b{month_rgx}\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,)?\s+(\d{{4}})\b", t, flags=re.I):
+        mon = MONTH_NAME_TO_NUM.get(m.group(1).lower(), 0)
+        day = int(m.group(2))
+        year = int(m.group(3))
+        if mon and 1 <= day <= 31:
+            out.add(f"{year:04d}-{mon:02d}-{day:02d}")
+    return out
+
+def faq_answers_conflict(question: str, comp_answer: str, bayut_answer: str) -> bool:
+    if not _question_has_date_intent(question):
+        return False
+    c_dates = _extract_date_signatures(comp_answer)
+    b_dates = _extract_date_signatures(bayut_answer)
+    if c_dates and b_dates and c_dates.isdisjoint(b_dates):
+        return True
+    return False
+
 def missing_faqs_row(
     bayut_nodes: List[dict],
     bayut_fr: FetchResult,
@@ -1769,22 +2006,53 @@ def missing_faqs_row(
     if not page_has_real_faq(comp_fr, comp_nodes):
         return None
 
-    comp_qs = extract_faq_questions(comp_fr, comp_nodes)
-    comp_qs = [q for q in comp_qs if q and len(q) > 5]
-    if not comp_qs:
+    comp_pairs = extract_faq_pairs(comp_fr, comp_nodes)
+    comp_pairs = [p for p in comp_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
+    if not comp_pairs:
         return None
 
     bayut_has = page_has_real_faq(bayut_fr, bayut_nodes)
-    bayut_qs = []
+    bayut_pairs = []
     if bayut_has:
-        bayut_qs = extract_faq_questions(bayut_fr, bayut_nodes)
-    bayut_qs = [q for q in bayut_qs if q and len(q) > 5]
+        bayut_pairs = extract_faq_pairs(bayut_fr, bayut_nodes)
+    bayut_pairs = [p for p in bayut_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
     bayut_corpus = _coverage_corpus(bayut_fr, bayut_nodes)
 
     missing_qs = []
-    for q in comp_qs:
-        if any(faq_questions_equivalent(q, bq) for bq in bayut_qs):
+    related_qs = []
+    conflicts = []
+
+    for cp in comp_pairs:
+        q = clean(cp.get("question", ""))
+        comp_answer = clean(cp.get("answer", ""))
+        if not q:
             continue
+
+        matched = None
+        best_score = 0.0
+        for bp in bayut_pairs:
+            bq = clean(bp.get("question", ""))
+            if not bq:
+                continue
+            if not faq_questions_equivalent(q, bq):
+                continue
+            sc = header_similarity(faq_topic_from_question(q), faq_topic_from_question(bq))
+            if sc > best_score:
+                best_score = sc
+                matched = bp
+
+        if matched:
+            bayut_answer = clean(matched.get("answer", ""))
+            if faq_answers_conflict(q, comp_answer, bayut_answer):
+                c_dates = ", ".join(sorted(_extract_date_signatures(comp_answer))) or "not detected"
+                b_dates = ", ".join(sorted(_extract_date_signatures(bayut_answer))) or "not detected"
+                conflicts.append(f"{q} (Competitor: {c_dates}; Bayut: {b_dates})")
+            continue
+
+        if bayut_pairs and any(faq_questions_related(q, clean(bp.get("question", ""))) for bp in bayut_pairs):
+            related_qs.append(q)
+            continue
+
         # Do not hide FAQ gaps aggressively when Bayut has no real FAQ block.
         if HIGH_PRECISION_MODE and bayut_has and faq_topic_covered_in_text(q, bayut_corpus):
             continue
@@ -1793,25 +2061,38 @@ def missing_faqs_row(
         missing_qs.append(q)
 
     # In strict mode, allow a single FAQ gap only when it's clearly missing.
-    if HIGH_PRECISION_MODE and bayut_has and len(missing_qs) == 1:
+    if HIGH_PRECISION_MODE and bayut_has and len(missing_qs) == 1 and not conflicts:
         only_q = missing_qs[0]
         only_topic = faq_topic_from_question(only_q)
         topic_cov = _topic_coverage_ratio(only_topic, bayut_corpus) if only_topic else 0.0
         if topic_cov >= SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE:
             return None
-    if not missing_qs:
+    if not missing_qs and not conflicts:
         return None
 
-    def as_question_list(items: List[str]) -> str:
+    def as_question_list(items: List[str], label: str = "") -> str:
         cleaned = [clean(i) for i in items if clean(i)]
         if not cleaned:
             return ""
         parts = [f"{idx + 1}-{html_lib.escape(q)}" for idx, q in enumerate(cleaned)]
-        return "<div>" + " ".join(parts) + "</div>"
+        body = "<div>" + " ".join(parts) + "</div>"
+        if label:
+            return f"<div>{html_lib.escape(label)}</div>" + body
+        return body
+
+    desc_parts = []
+    if missing_qs:
+        desc_parts.append(as_question_list(missing_qs, label="Missing FAQ intents:"))
+    if conflicts:
+        desc_parts.append(as_question_list(conflicts, label="Potential answer conflicts on matched FAQ intents:"))
+    if related_qs and not missing_qs:
+        rel_txt = format_gap_list(related_qs, limit=2)
+        if rel_txt:
+            desc_parts.append(f"<div>Related (partial overlap): {html_lib.escape(rel_txt)}.</div>")
 
     return {
         "Headers": "FAQs",
-        "Description": as_question_list(missing_qs),
+        "Description": "".join(desc_parts).strip(),
         "Source": source_link(comp_url),
     }
 
