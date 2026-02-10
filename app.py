@@ -772,8 +772,15 @@ class FetchAgent:
 
         # Remove recurring non-content wrappers before extracting text.
         for el in list(soup.find_all(True)):
-            cls = " ".join(el.get("class", []) or []).lower()
-            el_id = (el.get("id") or "").lower()
+            attrs = getattr(el, "attrs", None)
+            if not isinstance(attrs, dict):
+                continue
+            cls_raw = attrs.get("class", [])
+            if isinstance(cls_raw, (list, tuple, set)):
+                cls = " ".join(str(x) for x in cls_raw if x is not None).lower()
+            else:
+                cls = str(cls_raw or "").lower()
+            el_id = str(attrs.get("id", "") or "").lower()
             if any(tok in cls or tok in el_id for tok in NONCONTENT_TOKENS):
                 el.decompose()
 
@@ -1630,8 +1637,15 @@ def _faq_questions_from_html(html: str) -> List[str]:
 
     candidates = []
     for tag in soup.find_all(True):
-        id_attr = (tag.get("id") or "").lower()
-        cls_attr = " ".join(tag.get("class", []) or []).lower()
+        attrs = getattr(tag, "attrs", None)
+        if not isinstance(attrs, dict):
+            continue
+        cls_raw = attrs.get("class", [])
+        if isinstance(cls_raw, (list, tuple, set)):
+            cls_attr = " ".join(str(x) for x in cls_raw if x is not None).lower()
+        else:
+            cls_attr = str(cls_raw or "").lower()
+        id_attr = str(attrs.get("id", "") or "").lower()
         if re.search(r"\bfaq\b|\bfaqs\b|\baccordion\b|\bquestions\b", id_attr + " " + cls_attr):
             candidates.append(tag)
 
@@ -1734,8 +1748,15 @@ def _faq_pairs_from_html(html: str) -> List[dict]:
 
     candidates = []
     for tag in soup.find_all(True):
-        id_attr = (tag.get("id") or "").lower()
-        cls_attr = " ".join(tag.get("class", []) or []).lower()
+        attrs = getattr(tag, "attrs", None)
+        if not isinstance(attrs, dict):
+            continue
+        cls_raw = attrs.get("class", [])
+        if isinstance(cls_raw, (list, tuple, set)):
+            cls_attr = " ".join(str(x) for x in cls_raw if x is not None).lower()
+        else:
+            cls_attr = str(cls_raw or "").lower()
+        id_attr = str(attrs.get("id", "") or "").lower()
         if re.search(r"\bfaq\b|\bfaqs\b|\baccordion\b|\bquestions\b", id_attr + " " + cls_attr):
             candidates.append(tag)
 
