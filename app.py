@@ -764,11 +764,61 @@ class FetchAgent:
         return True
 
     def _extract_article_text_from_html(self, html: str) -> str:
+        if not html:
+            return ""
         soup = BeautifulSoup(html, "html.parser")
         for t in soup.find_all(list(self.ignore_tags)):
             t.decompose()
-        article = soup.find("article") or soup
-        return self.clean(article.get_text(" "))
+
+        # Remove recurring non-content wrappers before extracting text.
+        for el in list(soup.find_all(True)):
+            cls = " ".join(el.get("class", []) or []).lower()
+            el_id = (el.get("id") or "").lower()
+            if any(tok in cls or tok in el_id for tok in NONCONTENT_TOKENS):
+                el.decompose()
+
+        candidate_roots = [
+            soup.find(attrs={"itemprop": re.compile(r"articleBody", re.I)}),
+            soup.find("article"),
+            soup.find("main"),
+            soup.body,
+            soup,
+        ]
+        candidates: List[Tuple[int, str]] = []
+        seen_roots = set()
+
+        for root in candidate_roots:
+            if root is None:
+                continue
+            rid = id(root)
+            if rid in seen_roots:
+                continue
+            seen_roots.add(rid)
+
+            chunks = []
+            seen_chunks = set()
+            for tag in root.find_all(["h1", "h2", "h3", "h4", "p", "li", "dt", "dd"]):
+                txt = self.clean(tag.get_text(" "))
+                if not txt or len(txt) < 4:
+                    continue
+                nk = norm_header(txt)
+                if not nk or nk in seen_chunks:
+                    continue
+                seen_chunks.add(nk)
+                chunks.append(txt)
+
+            text = self.clean(" ".join(chunks)) if chunks else self.clean(root.get_text(" "))
+            if not text:
+                continue
+            word_count = len(re.findall(r"\b\w+\b", text))
+            heading_count = len(root.find_all(["h2", "h3", "h4"]))
+            score = word_count + (14 * heading_count)
+            candidates.append((score, text))
+
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
 
     def _fetch_playwright_html(self, url: str, timeout_ms: int = 25000) -> Tuple[bool, str]:
         if not PLAYWRIGHT_OK:
@@ -792,42 +842,73 @@ class FetchAgent:
             return FetchResult(False, None, None, "", "", "empty_url")
 
         html_fallback = ""
+        last_status = None
+        candidates = []
+
+        def add_candidate(source: str, status: int, html_doc: str, text_doc: str, min_len: int):
+            txt = self.clean(text_doc or "")
+            if not txt:
+                return
+            if self.looks_blocked(txt):
+                return
+            if len(txt) < min_len:
+                return
+            candidates.append({
+                "source": source,
+                "status": status,
+                "html": html_doc or "",
+                "text": txt,
+            })
 
         # 1) direct HTML
         code, html = self._http_get(url)
+        last_status = code or last_status
         if code == 200 and html:
             text = self._extract_article_text_from_html(html)
-            if self._validate_text(text, min_len=500):
-                return FetchResult(True, "direct", code, html, text, None)
-            html_fallback = html
+            add_candidate("direct", code, html, text, min_len=320)
+            html_fallback = html or html_fallback
 
         # 2) JS-rendered HTML
         ok, html2 = self._fetch_playwright_html(url)
         if ok and html2:
             text2 = self._extract_article_text_from_html(html2)
-            if self._validate_text(text2, min_len=500):
-                return FetchResult(True, "playwright", 200, html2, text2, None)
+            add_candidate("playwright", 200, html2, text2, min_len=320)
             html_fallback = html2 or html_fallback
 
         # 3) Jina reader
         jurl = self._jina_url(url)
         code3, txt3 = self._http_get(jurl)
+        last_status = code3 or last_status
         if code3 == 200 and txt3:
             text3 = self.clean(txt3)
-            if self._validate_text(text3, min_len=500):
-                return FetchResult(True, "jina", code3, html_fallback, text3, None)
+            add_candidate("jina", code3, html_fallback, text3, min_len=300)
 
         # 4) Textise
         turl = self._textise_url(url)
         code4, html4 = self._http_get(turl)
+        last_status = code4 or last_status
         if code4 == 200 and html4:
             soup = BeautifulSoup(html4, "html.parser")
             text4 = self.clean(soup.get_text(" "))
-            if self._validate_text(text4, min_len=350):
-                html_out = html4 or html_fallback
-                return FetchResult(True, "textise", code4, html_out, text4, None)
+            html_out = html4 or html_fallback
+            add_candidate("textise", code4, html_out, text4, min_len=260)
 
-        return FetchResult(False, None, code or None, "", "", "blocked_or_no_content")
+        if candidates:
+            source_priority = {"playwright": 4, "direct": 3, "jina": 2, "textise": 1}
+            best = max(
+                candidates,
+                key=lambda c: (len(c.get("text", "")), source_priority.get(c.get("source", ""), 0)),
+            )
+            return FetchResult(
+                True,
+                best.get("source"),
+                best.get("status"),
+                best.get("html", ""),
+                best.get("text", ""),
+                None,
+            )
+
+        return FetchResult(False, None, last_status, "", "", "blocked_or_no_content")
 
 
 agent = FetchAgent(
@@ -905,12 +986,15 @@ GENERIC_STOP = {
     "property","properties","rent","sale","apartments","villas","guide"
 }
 
-# Conservative defaults: prefer suppressing uncertain gaps over false positives.
+# Balanced defaults: catch more genuine gaps while still filtering obvious noise.
 HIGH_PRECISION_MODE = True
-MISSING_HEADER_MIN_TEXT_COVERAGE = 0.72
-MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.70
-MISSING_FAQ_MIN_TEXT_COVERAGE = 0.65
-SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE = 0.45
+MISSING_HEADER_MIN_TEXT_COVERAGE = 0.66
+MISSING_SUBTOPIC_MIN_TEXT_COVERAGE = 0.62
+MISSING_FAQ_MIN_TEXT_COVERAGE = 0.58
+SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE = 0.50
+HEADER_MATCH_MIN_SCORE = 0.69
+SIMILAR_HEADER_MATCH_FALLBACK = 0.62
+MAX_CONTENT_GAP_ITEMS = 8
 
 def norm_header(h: str) -> str:
     h = clean(h).lower()
@@ -2029,10 +2113,6 @@ def missing_faqs_row(
         if matched:
             continue
 
-        # Ignore weak overlaps; only mark a gap when no equivalent/related FAQ question exists.
-        if bayut_pairs and any(faq_questions_related(q, clean(bp.get("question", ""))) for bp in bayut_pairs):
-            continue
-
         missing_qs.append(q)
 
     dedup_missing: List[str] = []
@@ -2146,7 +2226,7 @@ def header_similarity(a: str, b: str) -> float:
 
     return max(base, core_score, subset_bonus)
 
-def find_best_bayut_match(comp_header: str, bayut_sections: List[dict], min_score: float = 0.73) -> Optional[dict]:
+def find_best_bayut_match(comp_header: str, bayut_sections: List[dict], min_score: float = HEADER_MATCH_MIN_SCORE) -> Optional[dict]:
     best = None
     best_score = 0.0
     for b in bayut_sections:
@@ -2156,6 +2236,16 @@ def find_best_bayut_match(comp_header: str, bayut_sections: List[dict], min_scor
             best = b
     if best and best_score >= min_score:
         return {"bayut_section": best, "score": best_score}
+    if not best:
+        return None
+
+    # Smart fallback: allow semantic token overlap when wording differs.
+    comp_core = set(_header_core_tokens(comp_header))
+    best_core = set(_header_core_tokens(best.get("header", "")))
+    if comp_core and best_core:
+        overlap = len(comp_core & best_core) / max(min(len(comp_core), len(best_core)), 1)
+        if overlap >= 0.67 and best_score >= SIMILAR_HEADER_MATCH_FALLBACK:
+            return {"bayut_section": best, "score": best_score}
     return None
 
 def dedupe_rows(rows: List[dict]) -> List[dict]:
@@ -2201,6 +2291,90 @@ def theme_flags(text: str) -> set:
 
     return flags
 
+def _titleish_phrase(phrase: str) -> str:
+    words = clean(phrase).split()
+    if not words:
+        return ""
+    keep_lower = {"and", "or", "of", "in", "on", "to", "for", "vs", "the", "a", "an", "with"}
+    out = []
+    for i, w in enumerate(words):
+        lw = w.lower()
+        if i > 0 and lw in keep_lower:
+            out.append(lw)
+        else:
+            out.append(lw.capitalize())
+    return " ".join(out)
+
+def _content_points_from_text(text: str, limit: int = 8) -> List[str]:
+    txt = clean(text or "")
+    if len(txt) < 40:
+        return []
+
+    freq = phrase_candidates(txt, n_min=2, n_max=4)
+    if not freq:
+        return []
+
+    scored = sorted(freq.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
+    out: List[str] = []
+    seen = set()
+    for phrase, _ in scored:
+        p = clean(phrase)
+        if not p or len(p) < 8:
+            continue
+        if HIGH_PRECISION_MODE and _is_low_signal_subtopic(p):
+            continue
+        k = norm_header(p)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(_titleish_phrase(p))
+        if len(out) >= limit:
+            break
+    return out
+
+def _missing_content_points(
+    comp_text: str,
+    bayut_text: str,
+    bayut_global_text: str,
+    limit: int = MAX_CONTENT_GAP_ITEMS,
+) -> List[str]:
+    candidates = _content_points_from_text(comp_text, limit=36)
+    if not candidates:
+        return []
+
+    out: List[str] = []
+    seen = set()
+    bayut_local = clean(bayut_text or "")
+    bayut_global = clean(bayut_global_text or "")
+
+    for point in candidates:
+        pk = norm_header(point)
+        if not pk or pk in seen:
+            continue
+
+        if _subtopic_covered_in_text(point, bayut_local):
+            continue
+
+        cov_local = _topic_coverage_ratio(point, bayut_local)
+        toks = _header_core_tokens(point)
+        if toks:
+            if len(toks) <= 2 and cov_local >= 1.0:
+                continue
+            if len(toks) > 2 and cov_local >= MISSING_SUBTOPIC_MIN_TEXT_COVERAGE:
+                continue
+
+        if HIGH_PRECISION_MODE and bayut_global and toks and len(toks) >= 3:
+            cov_global = _topic_coverage_ratio(point, bayut_global)
+            if cov_global >= 0.92:
+                continue
+
+        seen.add(pk)
+        out.append(point)
+        if len(out) >= limit:
+            break
+
+    return out
+
 def summarize_missing_section_action(header: str, subheaders: Optional[List[str]], comp_content: str) -> str:
     themes = list(theme_flags(comp_content))
     human_map = {
@@ -2223,8 +2397,13 @@ def summarize_missing_section_action(header: str, subheaders: Optional[List[str]
         theme_list = format_gap_list(picks, limit=4)
         if theme_list:
             parts.append(f"Missing coverage on: {theme_list}.")
+    seed_points = _content_points_from_text(comp_content, limit=4)
+    if seed_points:
+        seed_list = format_gap_list(seed_points, limit=4)
+        if seed_list:
+            parts.append(f"Add this header and cover: {seed_list}.")
     if not parts:
-        parts.append("Missing this section.")
+        parts.append("Add this header and include practical competitor-level detail.")
     return " ".join(parts)
 
 def summarize_content_gap_action(header: str, comp_content: str, bayut_content: str) -> str:
@@ -2313,7 +2492,13 @@ def update_mode_rows_header_first(
         for ch in comp_children:
             if HIGH_PRECISION_MODE and _is_low_signal_subtopic(ch):
                 continue
-            if _topic_is_covered(ch, child_section_objs, bayut_text, min_header_score=0.73, min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE):
+            if _topic_is_covered(
+                ch,
+                child_section_objs,
+                bayut_text,
+                min_header_score=HEADER_MATCH_MIN_SCORE,
+                min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
+            ):
                 continue
             if _subtopic_covered_in_text(ch, bayut_text):
                 continue
@@ -2358,13 +2543,13 @@ def update_mode_rows_header_first(
         comp_children = child_headers(comp_children_map, comp_header)
         comp_text = combined_h2_content(comp_header, comp_h2, comp_children_map) or cs.get("content", "")
 
-        m = find_best_bayut_match(comp_header, bayut_h2, min_score=0.73)
+        m = find_best_bayut_match(comp_header, bayut_h2, min_score=HEADER_MATCH_MIN_SCORE)
         if not m:
             if HIGH_PRECISION_MODE and _topic_is_covered(
                 comp_header,
                 bayut_h2 + bayut_child_sections,
                 bayut_global_text,
-                min_header_score=0.73,
+                min_header_score=HEADER_MATCH_MIN_SCORE,
                 min_text_coverage=MISSING_HEADER_MIN_TEXT_COVERAGE,
             ):
                 continue
@@ -2376,33 +2561,46 @@ def update_mode_rows_header_first(
         bayut_child_headers = child_headers(bayut_children_map, bayut_header)
         bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
         missing_sub = missing_children(comp_children, bayut_child_headers, bayut_text, bayut_global_text)
+        missing_points = _missing_content_points(comp_text, bayut_text, bayut_global_text, limit=MAX_CONTENT_GAP_ITEMS)
+
+        merged_missing: List[str] = []
+        seen_missing = set()
+        for item in (missing_sub + missing_points):
+            it = clean(item)
+            if not it:
+                continue
+            k = norm_header(it)
+            if not k or k in seen_missing:
+                continue
+            seen_missing.add(k)
+            merged_missing.append(it)
 
         parts = []
-        if missing_sub:
-            sub_list = format_gap_list(missing_sub, limit=6)
+        if merged_missing:
+            sub_list = format_gap_list(merged_missing, limit=MAX_CONTENT_GAP_ITEMS)
             if sub_list:
-                parts.append(f"Missing subtopics: {sub_list}.")
+                parts.append(f"Missing content: {sub_list}.")
 
         depth_note = depth_gap_summary(comp_text, bayut_text)
         if depth_note:
             parts.append(depth_note)
 
         if parts:
-            add_row(comp_header, parts)
+            add_row(bayut_header or comp_header, parts)
 
     comp_h2_norms = {norm_header(h.get("header", "")) for h in comp_h2}
     for cs in comp_children_all:
         parent = cs.get("parent_h2") or ""
         if parent and norm_header(parent) in comp_h2_norms:
             continue
-        m = find_best_bayut_match(cs["header"], bayut_child_sections + bayut_h2, min_score=0.73)
+        m = find_best_bayut_match(cs["header"], bayut_child_sections + bayut_h2, min_score=HEADER_MATCH_MIN_SCORE)
         if m:
             continue
         if HIGH_PRECISION_MODE and _topic_is_covered(
             cs["header"],
             bayut_child_sections + bayut_h2,
             bayut_global_text,
-            min_header_score=0.73,
+            min_header_score=HEADER_MATCH_MIN_SCORE,
             min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
         ):
             continue
