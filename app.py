@@ -7,7 +7,7 @@ import re
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urlparse
 import pandas as pd
-import time, random, hashlib
+import time, hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -726,11 +726,18 @@ class FetchAgent:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
         ]
 
+    def _stable_user_agent(self, url: str, attempt: int = 0) -> str:
+        if not self.user_agents:
+            return self.default_headers.get("User-Agent", "")
+        digest = int(hashlib.md5((url or "").encode("utf-8")).hexdigest(), 16)
+        idx = (digest + max(attempt, 0)) % len(self.user_agents)
+        return self.user_agents[idx]
+
     def _http_get(self, url: str, timeout: int = 25, tries: int = 3) -> Tuple[int, str]:
         last_code, last_text = 0, ""
         for i in range(tries):
             headers = dict(self.default_headers)
-            headers["User-Agent"] = random.choice(self.user_agents)
+            headers["User-Agent"] = self._stable_user_agent(url, i)
             try:
                 r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
                 last_code, last_text = r.status_code, (r.text or "")
@@ -833,7 +840,7 @@ class FetchAgent:
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-                ctx = browser.new_context(user_agent=random.choice(self.user_agents))
+                ctx = browser.new_context(user_agent=self._stable_user_agent(url, 0))
                 page = ctx.new_page()
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 page.wait_for_timeout(1400)
@@ -901,10 +908,11 @@ class FetchAgent:
             add_candidate("textise", code4, html_out, text4, min_len=260)
 
         if candidates:
-            source_priority = {"playwright": 4, "direct": 3, "jina": 2, "textise": 1}
+            # Keep source choice deterministic across runs: prefer stable HTML sources first.
+            source_priority = {"direct": 4, "playwright": 3, "jina": 2, "textise": 1}
             best = max(
                 candidates,
-                key=lambda c: (len(c.get("text", "")), source_priority.get(c.get("source", ""), 0)),
+                key=lambda c: (source_priority.get(c.get("source", ""), 0), len(c.get("text", ""))),
             )
             return FetchResult(
                 True,
@@ -934,10 +942,17 @@ def _safe_key(prefix: str, url: str) -> str:
 def resolve_all_or_require_manual(agent: FetchAgent, urls: List[str], st_key_prefix: str) -> Dict[str, FetchResult]:
     _ = st_key_prefix  # kept for backward compatibility with existing call sites
     results: Dict[str, FetchResult] = {}
+    cache = st.session_state.setdefault("__fetch_cache", {})
 
     for u in urls:
+        cached = cache.get(u)
+        if isinstance(cached, FetchResult) and cached.ok:
+            results[u] = cached
+            continue
         r = agent.resolve(u)
         results[u] = r
+        if r.ok:
+            cache[u] = r
         time.sleep(0.25)
     return results
 
