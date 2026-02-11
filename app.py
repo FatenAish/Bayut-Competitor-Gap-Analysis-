@@ -1001,7 +1001,7 @@ MISSING_FAQ_MIN_TEXT_COVERAGE = 0.58
 SINGLE_FAQ_SHOW_MAX_TOPIC_COVERAGE = 0.50
 HEADER_MATCH_MIN_SCORE = 0.69
 SIMILAR_HEADER_MATCH_FALLBACK = 0.62
-MAX_CONTENT_GAP_ITEMS = 8
+MAX_CONTENT_GAP_ITEMS = 4
 
 def norm_header(h: str) -> str:
     h = clean(h).lower()
@@ -2159,9 +2159,13 @@ def missing_faqs_row(
             return f"<div>{html_lib.escape(label)}</div>" + body
         return body
 
+    faq_limit = 4
+    shown_qs = missing_qs[:faq_limit]
     desc_parts = []
-    if missing_qs:
-        desc_parts.append(as_question_list(missing_qs, label="Missing FAQ questions:"))
+    if shown_qs:
+        desc_parts.append(as_question_list(shown_qs, label="Important missing FAQ questions:"))
+    if len(missing_qs) > faq_limit:
+        desc_parts.append(f"<div>+{len(missing_qs) - faq_limit} more FAQ gaps</div>")
 
     return {
         "Headers": "FAQs",
@@ -2312,46 +2316,67 @@ def theme_flags(text: str) -> set:
 
     return flags
 
-def _titleish_phrase(phrase: str) -> str:
-    words = clean(phrase).split()
-    if not words:
-        return ""
-    keep_lower = {"and", "or", "of", "in", "on", "to", "for", "vs", "the", "a", "an", "with"}
-    out = []
-    for i, w in enumerate(words):
-        lw = w.lower()
-        if i > 0 and lw in keep_lower:
-            out.append(lw)
-        else:
-            out.append(lw.capitalize())
-    return " ".join(out)
+IMPORTANT_POINT_SIGNAL_MAP = {
+    "Location & connectivity": [
+        "location", "connectivity", "access", "metro", "public transport", "bus", "road", "highway", "sheikh zayed",
+    ],
+    "Property types & ownership": [
+        "apartment", "villa", "townhouse", "penthouse", "property type", "freehold", "leasehold", "ownership",
+    ],
+    "Costs & service charges": [
+        "cost", "price", "pricing", "expensive", "afford", "budget", "fee", "fees", "service charge", "maintenance",
+    ],
+    "Amenities & facilities": [
+        "amenities", "facility", "facilities", "gym", "pool", "park", "beach", "shopping", "mall", "recreational",
+    ],
+    "Lifestyle & entertainment": [
+        "lifestyle", "restaurants", "cafes", "nightlife", "entertainment", "vibe", "atmosphere",
+    ],
+    "Schools & healthcare": [
+        "school", "nursery", "education", "clinic", "hospital", "healthcare", "medical",
+    ],
+    "Investment potential": [
+        "investment", "investor", "roi", "yield", "capital appreciation", "returns", "demand",
+    ],
+    "Pros & cons": [
+        "pros", "cons", "advantages", "disadvantages", "benefits", "challenges",
+    ],
+    "Safety & security": [
+        "safety", "security", "safe", "crime",
+    ],
+    "Parking & traffic": [
+        "parking", "traffic", "congestion", "rush hour",
+    ],
+}
 
-def _content_points_from_text(text: str, limit: int = 8) -> List[str]:
-    txt = clean(text or "")
-    if len(txt) < 40:
+def _contains_signal(text_norm: str, signal: str) -> bool:
+    sig = norm_header(signal)
+    if not sig:
+        return False
+    if " " in sig:
+        return sig in text_norm
+    return re.search(rf"\b{re.escape(sig)}\b", text_norm) is not None
+
+def _important_points_in_text(text: str, limit: int = 8) -> List[str]:
+    t = norm_header(text or "")
+    if not t:
         return []
-
-    freq = phrase_candidates(txt, n_min=2, n_max=4)
-    if not freq:
-        return []
-
-    scored = sorted(freq.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
     out: List[str] = []
-    seen = set()
-    for phrase, _ in scored:
-        p = clean(phrase)
-        if not p or len(p) < 8:
-            continue
-        if HIGH_PRECISION_MODE and _is_low_signal_subtopic(p):
-            continue
-        k = norm_header(p)
-        if not k or k in seen:
-            continue
-        seen.add(k)
-        out.append(_titleish_phrase(p))
+    for label, signals in IMPORTANT_POINT_SIGNAL_MAP.items():
+        if any(_contains_signal(t, sig) for sig in signals):
+            out.append(label)
         if len(out) >= limit:
             break
     return out
+
+def _important_point_covered(point_label: str, text: str) -> bool:
+    t = norm_header(text or "")
+    if not t:
+        return False
+    signals = IMPORTANT_POINT_SIGNAL_MAP.get(point_label, [])
+    if not signals:
+        return False
+    return any(_contains_signal(t, sig) for sig in signals)
 
 def _missing_content_points(
     comp_text: str,
@@ -2359,8 +2384,8 @@ def _missing_content_points(
     bayut_global_text: str,
     limit: int = MAX_CONTENT_GAP_ITEMS,
 ) -> List[str]:
-    candidates = _content_points_from_text(comp_text, limit=36)
-    if not candidates:
+    comp_points = _important_points_in_text(comp_text, limit=12)
+    if not comp_points:
         return []
 
     out: List[str] = []
@@ -2368,26 +2393,16 @@ def _missing_content_points(
     bayut_local = clean(bayut_text or "")
     bayut_global = clean(bayut_global_text or "")
 
-    for point in candidates:
+    for point in comp_points:
         pk = norm_header(point)
         if not pk or pk in seen:
             continue
 
-        if _subtopic_covered_in_text(point, bayut_local):
+        if _important_point_covered(point, bayut_local):
             continue
 
-        cov_local = _topic_coverage_ratio(point, bayut_local)
-        toks = _header_core_tokens(point)
-        if toks:
-            if len(toks) <= 2 and cov_local >= 1.0:
-                continue
-            if len(toks) > 2 and cov_local >= MISSING_SUBTOPIC_MIN_TEXT_COVERAGE:
-                continue
-
-        if HIGH_PRECISION_MODE and bayut_global and toks and len(toks) >= 3:
-            cov_global = _topic_coverage_ratio(point, bayut_global)
-            if cov_global >= 0.92:
-                continue
+        if HIGH_PRECISION_MODE and bayut_global and _important_point_covered(point, bayut_global):
+            continue
 
         seen.add(pk)
         out.append(point)
@@ -2397,32 +2412,32 @@ def _missing_content_points(
     return out
 
 def summarize_missing_section_action(header: str, subheaders: Optional[List[str]], comp_content: str) -> str:
-    themes = list(theme_flags(comp_content))
-    human_map = {
-        "transport": "commute & connectivity",
-        "traffic_parking": "traffic/parking realities",
-        "cost": "cost considerations",
-        "lifestyle": "lifestyle & vibe",
-        "daily_life": "day-to-day convenience",
-        "safety": "safety angle",
-        "decision_frame": "decision framing",
-        "comparison": "comparison context",
-    }
-    picks = [human_map.get(x, x) for x in themes]
     parts = []
     if subheaders:
-        sub_list = format_gap_list(subheaders, limit=6)
+        sub_list = format_gap_list(subheaders, limit=3)
         if sub_list:
             parts.append(f"Missing subtopics: {sub_list}.")
-    if picks:
-        theme_list = format_gap_list(picks, limit=4)
-        if theme_list:
-            parts.append(f"Missing coverage on: {theme_list}.")
-    seed_points = _content_points_from_text(comp_content, limit=4)
+    seed_points = _important_points_in_text(comp_content, limit=4)
     if seed_points:
         seed_list = format_gap_list(seed_points, limit=4)
         if seed_list:
-            parts.append(f"Add this header and cover: {seed_list}.")
+            parts.append(f"Add this header and cover important points: {seed_list}.")
+    else:
+        themes = list(theme_flags(comp_content))
+        human_map = {
+            "transport": "commute & connectivity",
+            "traffic_parking": "traffic/parking realities",
+            "cost": "cost considerations",
+            "lifestyle": "lifestyle & vibe",
+            "daily_life": "day-to-day convenience",
+            "safety": "safety angle",
+            "decision_frame": "decision framing",
+            "comparison": "comparison context",
+        }
+        picks = [human_map.get(x, x) for x in themes]
+        theme_list = format_gap_list(picks, limit=3)
+        if theme_list:
+            parts.append(f"Missing coverage on: {theme_list}.")
     if not parts:
         parts.append("Add this header and include practical competitor-level detail.")
     return " ".join(parts)
@@ -2600,11 +2615,12 @@ def update_mode_rows_header_first(
         if merged_missing:
             sub_list = format_gap_list(merged_missing, limit=MAX_CONTENT_GAP_ITEMS)
             if sub_list:
-                parts.append(f"Missing content: {sub_list}.")
+                parts.append(f"Important missing points: {sub_list}.")
 
-        depth_note = depth_gap_summary(comp_text, bayut_text)
-        if depth_note:
-            parts.append(depth_note)
+        if not merged_missing:
+            depth_note = depth_gap_summary(comp_text, bayut_text)
+            if depth_note:
+                parts.append(depth_note)
 
         if parts:
             add_row(bayut_header or comp_header, parts)
