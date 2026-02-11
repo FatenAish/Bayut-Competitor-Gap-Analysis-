@@ -2403,9 +2403,20 @@ def _missing_content_points(
     comp_text: str,
     bayut_text: str,
     bayut_global_text: str,
+    comp_children: Optional[List[str]] = None,
     limit: int = MAX_CONTENT_GAP_ITEMS,
 ) -> List[str]:
-    comp_points = _important_points_in_text(comp_text, limit=12)
+    child_chunks: List[str] = []
+    for h in comp_children or []:
+        hh = clean(h)
+        if not hh:
+            continue
+        if _looks_like_question(hh) or header_is_faq(hh):
+            continue
+        child_chunks.append(hh)
+    comp_scope = clean(" ".join([comp_text or ""] + child_chunks))
+
+    comp_points = _important_points_in_text(comp_scope, limit=12)
     if not comp_points:
         return []
 
@@ -2433,18 +2444,24 @@ def _missing_content_points(
     return out
 
 def summarize_missing_section_action(header: str, subheaders: Optional[List[str]], comp_content: str) -> str:
+    clean_subs: List[str] = []
+    for s in subheaders or []:
+        ss = clean(s)
+        if not ss:
+            continue
+        if _looks_like_question(ss) or header_is_faq(ss):
+            continue
+        clean_subs.append(ss)
+
+    scope = clean(" ".join([comp_content or ""] + clean_subs))
     parts = []
-    if subheaders:
-        sub_list = format_gap_list(subheaders, limit=3)
-        if sub_list:
-            parts.append(f"Missing subtopics: {sub_list}.")
-    seed_points = _important_points_in_text(comp_content, limit=4)
+    seed_points = _important_points_in_text(scope, limit=4)
     if seed_points:
         seed_list = format_gap_list(seed_points, limit=4)
         if seed_list:
-            parts.append(f"Add this header and cover important points: {seed_list}.")
+            parts.append(f"Add this header with: {seed_list}.")
     else:
-        themes = list(theme_flags(comp_content))
+        themes = list(theme_flags(scope))
         human_map = {
             "transport": "commute & connectivity",
             "traffic_parking": "traffic/parking realities",
@@ -2458,9 +2475,9 @@ def summarize_missing_section_action(header: str, subheaders: Optional[List[str]
         picks = [human_map.get(x, x) for x in themes]
         theme_list = format_gap_list(picks, limit=3)
         if theme_list:
-            parts.append(f"Missing coverage on: {theme_list}.")
+            parts.append(f"Add this header with: {theme_list}.")
     if not parts:
-        parts.append("Add this header and include practical competitor-level detail.")
+        parts.append("Add this header with key practical details.")
     return " ".join(parts)
 
 def summarize_content_gap_action(header: str, comp_content: str, bayut_content: str) -> str:
@@ -2538,41 +2555,6 @@ def update_mode_rows_header_first(
         child_content = " ".join(c.get("content", "") for c in cmap.get(pk, []))
         return clean(" ".join([h2_content, child_content]))
 
-    def missing_children(
-        comp_children: List[str],
-        bayut_children: List[str],
-        bayut_text: str,
-        bayut_global_text: str,
-    ) -> List[str]:
-        missing = []
-        child_section_objs = [{"header": h} for h in bayut_children if clean(h)]
-        for ch in comp_children:
-            # FAQ-like question headings are handled by FAQ logic, not section subtopics.
-            if _looks_like_question(ch):
-                continue
-            if HIGH_PRECISION_MODE and _is_low_signal_subtopic(ch):
-                continue
-            if _topic_is_covered(
-                ch,
-                child_section_objs,
-                bayut_text,
-                min_header_score=HEADER_MATCH_MIN_SCORE,
-                min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
-            ):
-                continue
-            if _subtopic_covered_in_text(ch, bayut_text):
-                continue
-            if HIGH_PRECISION_MODE:
-                cov_all = _topic_coverage_ratio(ch, bayut_global_text)
-                toks = _header_core_tokens(ch)
-                if toks:
-                    if len(toks) <= 2 and cov_all >= 1.0:
-                        continue
-                    if len(toks) > 2 and cov_all >= MISSING_SUBTOPIC_MIN_TEXT_COVERAGE:
-                        continue
-            missing.append(ch)
-        return missing
-
     def depth_gap_summary(comp_text: str, bayut_text: str) -> str:
         c_txt = clean(comp_text or "")
         b_txt = clean(bayut_text or "")
@@ -2600,7 +2582,12 @@ def update_mode_rows_header_first(
 
     for cs in comp_h2:
         comp_header = cs.get("header", "")
-        comp_children = child_headers(comp_children_map, comp_header)
+        if not comp_header or header_is_faq(comp_header) or _looks_like_question(comp_header):
+            continue
+        comp_children = [
+            h for h in child_headers(comp_children_map, comp_header)
+            if clean(h) and not _looks_like_question(clean(h)) and not header_is_faq(clean(h))
+        ]
         comp_text = combined_h2_content(comp_header, comp_h2, comp_children_map) or cs.get("content", "")
 
         m = find_best_bayut_match(comp_header, bayut_h2, min_score=HEADER_MATCH_MIN_SCORE)
@@ -2618,30 +2605,22 @@ def update_mode_rows_header_first(
             continue
 
         bayut_header = m["bayut_section"]["header"]
-        bayut_child_headers = child_headers(bayut_children_map, bayut_header)
         bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
-        missing_sub = missing_children(comp_children, bayut_child_headers, bayut_text, bayut_global_text)
-        missing_points = _missing_content_points(comp_text, bayut_text, bayut_global_text, limit=MAX_CONTENT_GAP_ITEMS)
-
-        merged_missing: List[str] = []
-        seen_missing = set()
-        for item in (missing_sub + missing_points):
-            it = clean(item)
-            if not it:
-                continue
-            k = norm_header(it)
-            if not k or k in seen_missing:
-                continue
-            seen_missing.add(k)
-            merged_missing.append(it)
+        missing_points = _missing_content_points(
+            comp_text,
+            bayut_text,
+            bayut_global_text,
+            comp_children=comp_children,
+            limit=MAX_CONTENT_GAP_ITEMS,
+        )
 
         parts = []
-        if merged_missing:
-            sub_list = format_gap_list(merged_missing, limit=MAX_CONTENT_GAP_ITEMS)
+        if missing_points:
+            sub_list = format_gap_list(missing_points, limit=MAX_CONTENT_GAP_ITEMS)
             if sub_list:
                 parts.append(f"Important missing points: {sub_list}.")
 
-        if not merged_missing:
+        if not missing_points:
             depth_note = depth_gap_summary(comp_text, bayut_text)
             if depth_note:
                 parts.append(depth_note)
@@ -2651,22 +2630,25 @@ def update_mode_rows_header_first(
 
     comp_h2_norms = {norm_header(h.get("header", "")) for h in comp_h2}
     for cs in comp_children_all:
+        ch = clean(cs.get("header", ""))
+        if not ch or _looks_like_question(ch) or header_is_faq(ch):
+            continue
         parent = cs.get("parent_h2") or ""
         if parent and norm_header(parent) in comp_h2_norms:
             continue
-        m = find_best_bayut_match(cs["header"], bayut_child_sections + bayut_h2, min_score=HEADER_MATCH_MIN_SCORE)
+        m = find_best_bayut_match(ch, bayut_child_sections + bayut_h2, min_score=HEADER_MATCH_MIN_SCORE)
         if m:
             continue
         if HIGH_PRECISION_MODE and _topic_is_covered(
-            cs["header"],
+            ch,
             bayut_child_sections + bayut_h2,
             bayut_global_text,
             min_header_score=HEADER_MATCH_MIN_SCORE,
             min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
         ):
             continue
-        desc = summarize_missing_section_action(cs["header"], None, cs.get("content", ""))
-        add_row(cs["header"], [desc])
+        desc = summarize_missing_section_action(ch, None, cs.get("content", ""))
+        add_row(ch, [desc])
 
     rows = []
     for r in rows_map.values():
