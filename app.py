@@ -1036,6 +1036,8 @@ TOPIC_TOKEN_ALIASES = {
     "place": {"place", "places", "venue", "venues", "spot", "spots", "destination", "destinations", "location", "locations"},
     "event": {"event", "events", "celebrate", "celebration", "festival", "festivals", "activity", "activities", "entertainment", "happening", "happenings"},
     "tip": {"tip", "tips", "practical", "advice", "suggestion", "suggestions"},
+    "pros": {"pro", "pros", "advantage", "advantages", "benefit", "benefits", "positive", "positives"},
+    "cons": {"con", "cons", "disadvantage", "disadvantages", "challenge", "challenges", "drawback", "drawbacks", "consider", "considerations"},
 }
 
 LOW_SIGNAL_SUBTOPICS = {
@@ -1047,6 +1049,13 @@ FAQ_FILLER_TOKENS = {
     "faq", "faqs", "question", "questions", "attend", "attendance", "visitor", "visitors",
     "visit", "visiting",
 }
+
+HEADER_OPPOSITE_GROUPS = [
+    (
+        {"pro", "pros", "advantage", "advantages", "benefit", "benefits", "positive", "positives"},
+        {"con", "cons", "disadvantage", "disadvantages", "challenge", "challenges", "drawback", "drawbacks", "negative", "negatives"},
+    )
+]
 
 def _canonical_topic_token(tok: str) -> str:
     stem = _stem_token(tok)
@@ -1070,6 +1079,13 @@ def _token_aliases(tok: str) -> set:
             aliases |= bucket
             break
     return aliases
+
+def _header_has_any_marker(text: str, words: set) -> bool:
+    toks = set(_tokenize_norm_words(text or ""))
+    if not toks:
+        return False
+    word_stems = {_stem_token(w) for w in words}
+    return bool(toks & word_stems)
 
 def _header_core_tokens(text: str) -> List[str]:
     out = []
@@ -1517,7 +1533,14 @@ def _looks_like_question(s: str) -> bool:
     s = clean(s)
     if not s or len(s) < 6:
         return False
+    s = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = clean(s)
+    if not s:
+        return False
     s_low = s.lower()
+    if re.search(r"\b(looking to (rent|buy)|request a call|contact us|get in touch|subscribe|newsletter)\b", s_low):
+        return False
     if "?" in s:
         return True
     if re.match(r"^(what|where|when|why|how|who|which|can|is|are|do|does|did|should)\b", s_low):
@@ -1528,6 +1551,8 @@ def _looks_like_question(s: str) -> bool:
 
 def normalize_question(q: str) -> str:
     q = clean(q or "")
+    q = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", q)
+    q = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", q)
     q = re.sub(r"^\s*\d+[\.\)]\s*", "", q)
     q = re.sub(r"^\s*[-•]\s*", "", q)
     return q.strip()
@@ -2105,16 +2130,27 @@ def missing_faqs_row(
     comp_fr: FetchResult,
     comp_url: str
 ) -> Optional[dict]:
+    def _valid_faq_q(q: str) -> bool:
+        qn = normalize_question(q)
+        if not qn or len(qn) <= 5:
+            return False
+        if not _looks_like_question(qn):
+            return False
+        qn_low = qn.lower()
+        if re.search(r"\blooking to (rent|buy)\b|\brequest a call\b|\bcontact us\b", qn_low):
+            return False
+        return True
+
     if not page_has_real_faq(comp_fr, comp_nodes):
         return None
 
     comp_pairs = extract_faq_pairs(comp_fr, comp_nodes)
-    comp_pairs = [p for p in comp_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
+    comp_pairs = [p for p in comp_pairs if _valid_faq_q(clean(p.get("question", "")))]
     if not comp_pairs:
         return None
 
     bayut_pairs = extract_faq_pairs(bayut_fr, bayut_nodes) if page_has_real_faq(bayut_fr, bayut_nodes) else []
-    bayut_pairs = [p for p in bayut_pairs if clean(p.get("question", "")) and len(clean(p.get("question", ""))) > 5]
+    bayut_pairs = [p for p in bayut_pairs if _valid_faq_q(clean(p.get("question", "")))]
 
     missing_qs = []
 
@@ -2270,7 +2306,20 @@ def header_similarity(a: str, b: str) -> float:
     if 2 <= smallest <= 3 and (a_core.issubset(b_core) or b_core.issubset(a_core)):
         subset_bonus = 0.84
 
-    return max(base, core_score, subset_bonus)
+    score = max(base, core_score, subset_bonus)
+
+    # Prevent opposite-polarity headers from being treated as equivalent
+    # (e.g., "Advantages" vs "Disadvantages").
+    for pos_words, neg_words in HEADER_OPPOSITE_GROUPS:
+        a_pos = _header_has_any_marker(a, pos_words)
+        a_neg = _header_has_any_marker(a, neg_words)
+        b_pos = _header_has_any_marker(b, pos_words)
+        b_neg = _header_has_any_marker(b, neg_words)
+        if (a_pos and b_neg) or (a_neg and b_pos):
+            score *= 0.58
+            break
+
+    return score
 
 def find_best_bayut_match(comp_header: str, bayut_sections: List[dict], min_score: float = HEADER_MATCH_MIN_SCORE) -> Optional[dict]:
     best = None
@@ -2370,6 +2419,11 @@ IMPORTANT_POINT_SIGNAL_MAP = {
     ],
 }
 
+SECTION_POINT_SKIP = {
+    "other", "general", "overview", "summary", "conclusion", "faqs", "faq",
+    "introduction", "read more", "next", "previous",
+}
+
 def _contains_signal(text_norm: str, signal: str) -> bool:
     sig = norm_header(signal)
     if not sig:
@@ -2377,6 +2431,128 @@ def _contains_signal(text_norm: str, signal: str) -> bool:
     if " " in sig:
         return sig in text_norm
     return re.search(rf"\b{re.escape(sig)}\b", text_norm) is not None
+
+def _titleish_phrase(phrase: str) -> str:
+    words = clean(phrase).split()
+    if not words:
+        return ""
+    keep_lower = {"and", "or", "of", "in", "on", "to", "for", "vs", "the", "a", "an", "with"}
+    out = []
+    for i, w in enumerate(words):
+        lw = w.lower()
+        if i > 0 and lw in keep_lower:
+            out.append(lw)
+        else:
+            out.append(lw.capitalize())
+    return " ".join(out)
+
+def _clean_candidate_point(text: str) -> str:
+    s = clean(text or "")
+    s = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"^\s*\d+[\.\)]\s*", "", s)
+    s = re.sub(r"^\s*[-•]+\s*", "", s)
+    s = re.sub(r"\s*[:\-–—]\s*$", "", s)
+    s = re.sub(r"\s+", " ", s).strip(" .,-")
+    return clean(s)
+
+def _is_valid_section_point(point: str) -> bool:
+    p = _clean_candidate_point(point)
+    if not p:
+        return False
+    if len(p) < 4 or len(p) > 74:
+        return False
+    if _looks_like_question(p) or header_is_faq(p):
+        return False
+    if re.search(r"https?://|www\.|\[[^\]]+\]\([^)]+\)|\|", p, flags=re.I):
+        return False
+    pn = norm_header(p)
+    if not pn or pn in SECTION_POINT_SKIP:
+        return False
+    if sum(1 for c in p if c.isalpha()) / max(len(p), 1) < 0.55:
+        return False
+    for pat in NOISE_PATTERNS:
+        if re.search(pat, pn):
+            return False
+    return True
+
+def _points_from_subheaders(subheaders: List[str], limit: int = 10) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for raw in subheaders or []:
+        p = _clean_candidate_point(raw)
+        if not _is_valid_section_point(p):
+            continue
+        k = norm_header(p)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
+
+def _points_from_content_text(content: str, section_header: str, limit: int = 10) -> List[str]:
+    txt = clean(content or "")
+    if len(txt) < 160:
+        return []
+    freq = phrase_candidates(txt, n_min=2, n_max=4)
+    if not freq:
+        return []
+
+    scored = sorted(freq.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
+    out: List[str] = []
+    seen = set()
+    for phrase, cnt in scored:
+        if cnt < 2 and len(out) >= 2:
+            continue
+        p = _titleish_phrase(_clean_candidate_point(phrase))
+        if not _is_valid_section_point(p):
+            continue
+        if section_header and header_similarity(section_header, p) >= 0.95:
+            continue
+        if not _header_core_tokens(p):
+            continue
+        k = norm_header(p)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
+
+def _section_key_points(
+    section_header: str,
+    subheaders: Optional[List[str]],
+    section_text: str,
+    limit: int = 8,
+) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    def _append(points: List[str], cap: int):
+        for p in points:
+            pp = _clean_candidate_point(p)
+            if not _is_valid_section_point(pp):
+                continue
+            k = norm_header(pp)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(pp)
+            if len(out) >= cap:
+                break
+
+    _append(_points_from_subheaders(subheaders or [], limit=max(limit * 2, 8)), cap=limit)
+    if len(out) < limit:
+        _append(_points_from_content_text(section_text, section_header, limit=max(limit * 2, 8)), cap=limit)
+
+    if not out:
+        scope = clean(" ".join([section_header or "", section_text or ""] + (subheaders or [])))
+        _append(_important_points_in_text(scope, limit=limit), cap=limit)
+
+    return out[:limit]
 
 def _important_points_in_text(text: str, limit: int = 8) -> List[str]:
     t = norm_header(text or "")
@@ -2400,23 +2576,15 @@ def _important_point_covered(point_label: str, text: str) -> bool:
     return any(_contains_signal(t, sig) for sig in signals)
 
 def _missing_content_points(
+    comp_header: str,
     comp_text: str,
     bayut_text: str,
     bayut_global_text: str,
     comp_children: Optional[List[str]] = None,
+    bayut_children: Optional[List[str]] = None,
     limit: int = MAX_CONTENT_GAP_ITEMS,
 ) -> List[str]:
-    child_chunks: List[str] = []
-    for h in comp_children or []:
-        hh = clean(h)
-        if not hh:
-            continue
-        if _looks_like_question(hh) or header_is_faq(hh):
-            continue
-        child_chunks.append(hh)
-    comp_scope = clean(" ".join([comp_text or ""] + child_chunks))
-
-    comp_points = _important_points_in_text(comp_scope, limit=12)
+    comp_points = _section_key_points(comp_header, comp_children or [], comp_text, limit=max(limit * 3, 10))
     if not comp_points:
         return []
 
@@ -2424,16 +2592,32 @@ def _missing_content_points(
     seen = set()
     bayut_local = clean(bayut_text or "")
     bayut_global = clean(bayut_global_text or "")
+    bayut_child_objs = [{"header": h} for h in (bayut_children or []) if clean(h)]
 
     for point in comp_points:
         pk = norm_header(point)
         if not pk or pk in seen:
             continue
 
-        if _important_point_covered(point, bayut_local):
+        if _topic_is_covered(
+            point,
+            bayut_child_objs,
+            bayut_local,
+            min_header_score=HEADER_MATCH_MIN_SCORE,
+            min_text_coverage=MISSING_SUBTOPIC_MIN_TEXT_COVERAGE,
+        ):
             continue
 
-        if HIGH_PRECISION_MODE and bayut_global and _important_point_covered(point, bayut_global):
+        if _subtopic_covered_in_text(point, bayut_local):
+            continue
+
+        if HIGH_PRECISION_MODE and bayut_global and _topic_is_covered(
+            point,
+            [],
+            bayut_global,
+            min_header_score=HEADER_MATCH_MIN_SCORE,
+            min_text_coverage=max(MISSING_SUBTOPIC_MIN_TEXT_COVERAGE + 0.08, 0.78),
+        ):
             continue
 
         seen.add(pk)
@@ -2444,23 +2628,14 @@ def _missing_content_points(
     return out
 
 def summarize_missing_section_action(header: str, subheaders: Optional[List[str]], comp_content: str) -> str:
-    clean_subs: List[str] = []
-    for s in subheaders or []:
-        ss = clean(s)
-        if not ss:
-            continue
-        if _looks_like_question(ss) or header_is_faq(ss):
-            continue
-        clean_subs.append(ss)
-
-    scope = clean(" ".join([comp_content or ""] + clean_subs))
     parts = []
-    seed_points = _important_points_in_text(scope, limit=4)
+    seed_points = _section_key_points(header, subheaders or [], comp_content, limit=4)
     if seed_points:
         seed_list = format_gap_list(seed_points, limit=4)
         if seed_list:
             parts.append(f"Add this header with: {seed_list}.")
     else:
+        scope = clean(" ".join([header or "", comp_content or ""] + (subheaders or [])))
         themes = list(theme_flags(scope))
         human_map = {
             "transport": "commute & connectivity",
@@ -2605,12 +2780,18 @@ def update_mode_rows_header_first(
             continue
 
         bayut_header = m["bayut_section"]["header"]
+        bayut_child_headers = [
+            h for h in child_headers(bayut_children_map, bayut_header)
+            if clean(h) and not _looks_like_question(clean(h)) and not header_is_faq(clean(h))
+        ]
         bayut_text = combined_h2_content(bayut_header, bayut_h2, bayut_children_map)
         missing_points = _missing_content_points(
+            comp_header,
             comp_text,
             bayut_text,
             bayut_global_text,
             comp_children=comp_children,
+            bayut_children=bayut_child_headers,
             limit=MAX_CONTENT_GAP_ITEMS,
         )
 
