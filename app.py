@@ -4645,33 +4645,83 @@ def _styling_layout_label(html: str) -> str:
 
     has_infographic = False
     has_visuals = False
+
+    def _int_attr(v) -> int:
+        try:
+            return int(str(v).strip()) if v is not None and str(v).strip() != "" else 0
+        except Exception:
+            return 0
+
+    def _img_parts(img):
+        alt = clean(img.get("alt") or "").lower()
+        title = clean(img.get("title") or "").lower()
+        cls = " ".join(img.get("class") or []).lower()
+        el_id = (img.get("id") or "").lower()
+        src = (img.get("src") or img.get("data-src") or "").lower()
+        blob = " | ".join([alt, title, cls, el_id, src])
+        return alt, title, cls, blob
+
+    def _is_map_like_image(img) -> bool:
+        alt, title, _cls, blob = _img_parts(img)
+        map_tokens = (
+            "google map", "google maps", "maps.google", "maps.gstatic", "maps.googleapis",
+            "mapbox", "openstreetmap", "leaflet", "street view", "staticmap",
+            "location map", "map image", "gm-style"
+        )
+        if any(tok in blob for tok in map_tokens):
+            return True
+        if re.search(r"\bmap\b", alt) and re.search(r"\b(location|directions?|address|route)\b", alt):
+            return True
+        if re.search(r"\bmap\b", title) and re.search(r"\b(location|directions?|address|route)\b", title):
+            return True
+        return False
+
+    def _is_decorative_image(img) -> bool:
+        _alt, _title, _cls, blob = _img_parts(img)
+        if any(tok in blob for tok in ("logo", "icon", "avatar", "emoji", "sprite", "favicon", "brandmark")):
+            return True
+        w = _int_attr(img.get("width"))
+        h = _int_attr(img.get("height"))
+        if w and h and w <= 120 and h <= 120:
+            return True
+        return False
+
+    infographic_tokens = ("infographic", "chart", "graph", "diagram", "data visualization", "data viz")
     for img in root.find_all("img"):
-        alt = (img.get("alt") or "").lower()
-        title = (img.get("title") or "").lower()
-        if any(k in alt or k in title for k in ["infographic", "chart", "graph", "map", "diagram"]):
+        if _is_map_like_image(img):
+            continue
+        alt, title, _cls, _blob = _img_parts(img)
+        if any(tok in alt or tok in title for tok in infographic_tokens):
             has_infographic = True
             break
+
     if not has_infographic:
         for img in root.find_all("img"):
-            cls = " ".join(img.get("class") or []).lower()
-            width = img.get("width")
-            height = img.get("height")
-            try:
-                w = int(width) if width else 0
-                h = int(height) if height else 0
-            except Exception:
-                w, h = 0, 0
-            if "wp-image" in cls or "attachment" in cls or w >= 200 or h >= 200:
+            if _is_map_like_image(img) or _is_decorative_image(img):
+                continue
+            _alt, _title, cls, _blob = _img_parts(img)
+            w = _int_attr(img.get("width"))
+            h = _int_attr(img.get("height"))
+            if "wp-image" in cls or "attachment" in cls or w >= 240 or h >= 180:
                 has_visuals = True
                 break
-    if not has_infographic:
+
+    if not has_infographic and not has_visuals:
         for fig in root.find_all("figure"):
-            if fig.find("img"):
-                has_visuals = True
-                break
+            img = fig.find("img")
+            if not img:
+                continue
+            if _is_map_like_image(img) or _is_decorative_image(img):
+                continue
+            has_visuals = True
+            break
+
     if has_infographic or has_visuals:
         score += 1
-        signals.append("infographic/visuals")
+        if has_infographic:
+            signals.append("infographics/charts")
+        else:
+            signals.append("images/visuals")
 
     if score >= 3:
         label = "Good"
