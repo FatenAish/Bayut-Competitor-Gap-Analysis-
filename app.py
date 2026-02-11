@@ -4645,6 +4645,7 @@ def _styling_layout_label(html: str) -> str:
 
     has_infographic = False
     has_visuals = False
+    has_maps = False
 
     def _int_attr(v) -> int:
         try:
@@ -4686,9 +4687,57 @@ def _styling_layout_label(html: str) -> str:
             return True
         return False
 
+    def _is_map_like_iframe(frame) -> bool:
+        src = (frame.get("src") or "").lower()
+        title = clean(frame.get("title") or "").lower()
+        cls = " ".join(frame.get("class") or []).lower()
+        el_id = (frame.get("id") or "").lower()
+        blob = " | ".join([src, title, cls, el_id])
+        map_tokens = (
+            "google.com/maps",
+            "maps.google",
+            "maps/embed",
+            "maps.gstatic",
+            "maps.googleapis",
+            "mapbox",
+            "openstreetmap",
+            "leaflet",
+            "bing.com/maps",
+            "here.com",
+            "waze.com",
+        )
+        if any(tok in blob for tok in map_tokens):
+            return True
+        if "map" in title and any(tok in title for tok in ("location", "directions", "route")):
+            return True
+        return False
+
+    def _is_map_like_link(a) -> bool:
+        href = (a.get("href") or "").lower()
+        if not href:
+            return False
+        txt = clean(a.get_text(" ")).lower()
+        href_tokens = (
+            "google.com/maps",
+            "maps.google",
+            "maps.app.goo.gl",
+            "goo.gl/maps",
+            "mapbox.com",
+            "openstreetmap.org",
+            "bing.com/maps",
+            "waze.com",
+            "here.com",
+        )
+        if any(tok in href for tok in href_tokens):
+            return True
+        if re.search(r"\b(view larger map|get directions|open in maps?)\b", txt):
+            return True
+        return False
+
     infographic_tokens = ("infographic", "chart", "graph", "diagram", "data visualization", "data viz")
     for img in root.find_all("img"):
         if _is_map_like_image(img):
+            has_maps = True
             continue
         alt, title, _cls, _blob = _img_parts(img)
         if any(tok in alt or tok in title for tok in infographic_tokens):
@@ -4697,7 +4746,10 @@ def _styling_layout_label(html: str) -> str:
 
     if not has_infographic:
         for img in root.find_all("img"):
-            if _is_map_like_image(img) or _is_decorative_image(img):
+            if _is_map_like_image(img):
+                has_maps = True
+                continue
+            if _is_decorative_image(img):
                 continue
             _alt, _title, cls, _blob = _img_parts(img)
             w = _int_attr(img.get("width"))
@@ -4711,17 +4763,33 @@ def _styling_layout_label(html: str) -> str:
             img = fig.find("img")
             if not img:
                 continue
-            if _is_map_like_image(img) or _is_decorative_image(img):
+            if _is_map_like_image(img):
+                has_maps = True
+                continue
+            if _is_decorative_image(img):
                 continue
             has_visuals = True
             break
 
-    if has_infographic or has_visuals:
+    for frame in root.find_all("iframe"):
+        if _is_map_like_iframe(frame):
+            has_maps = True
+            break
+
+    if not has_maps:
+        for a in root.find_all("a", href=True):
+            if _is_map_like_link(a):
+                has_maps = True
+                break
+
+    if has_infographic or has_visuals or has_maps:
         score += 1
         if has_infographic:
             signals.append("infographics/charts")
-        else:
+        elif has_visuals:
             signals.append("images/visuals")
+        if has_maps:
+            signals.append("maps/location")
 
     if score >= 3:
         label = "Good"
