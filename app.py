@@ -4645,33 +4645,151 @@ def _styling_layout_label(html: str) -> str:
 
     has_infographic = False
     has_visuals = False
+    has_maps = False
+
+    def _int_attr(v) -> int:
+        try:
+            return int(str(v).strip()) if v is not None and str(v).strip() != "" else 0
+        except Exception:
+            return 0
+
+    def _img_parts(img):
+        alt = clean(img.get("alt") or "").lower()
+        title = clean(img.get("title") or "").lower()
+        cls = " ".join(img.get("class") or []).lower()
+        el_id = (img.get("id") or "").lower()
+        src = (img.get("src") or img.get("data-src") or "").lower()
+        blob = " | ".join([alt, title, cls, el_id, src])
+        return alt, title, cls, blob
+
+    def _is_map_like_image(img) -> bool:
+        alt, title, _cls, blob = _img_parts(img)
+        map_tokens = (
+            "google map", "google maps", "maps.google", "maps.gstatic", "maps.googleapis",
+            "mapbox", "openstreetmap", "leaflet", "street view", "staticmap",
+            "location map", "map image", "gm-style"
+        )
+        if any(tok in blob for tok in map_tokens):
+            return True
+        if re.search(r"\bmap\b", alt) and re.search(r"\b(location|directions?|address|route)\b", alt):
+            return True
+        if re.search(r"\bmap\b", title) and re.search(r"\b(location|directions?|address|route)\b", title):
+            return True
+        return False
+
+    def _is_decorative_image(img) -> bool:
+        _alt, _title, _cls, blob = _img_parts(img)
+        if any(tok in blob for tok in ("logo", "icon", "avatar", "emoji", "sprite", "favicon", "brandmark")):
+            return True
+        w = _int_attr(img.get("width"))
+        h = _int_attr(img.get("height"))
+        if w and h and w <= 120 and h <= 120:
+            return True
+        return False
+
+    def _is_map_like_iframe(frame) -> bool:
+        src = (frame.get("src") or "").lower()
+        title = clean(frame.get("title") or "").lower()
+        cls = " ".join(frame.get("class") or []).lower()
+        el_id = (frame.get("id") or "").lower()
+        blob = " | ".join([src, title, cls, el_id])
+        map_tokens = (
+            "google.com/maps",
+            "maps.google",
+            "maps/embed",
+            "maps.gstatic",
+            "maps.googleapis",
+            "mapbox",
+            "openstreetmap",
+            "leaflet",
+            "bing.com/maps",
+            "here.com",
+            "waze.com",
+        )
+        if any(tok in blob for tok in map_tokens):
+            return True
+        if "map" in title and any(tok in title for tok in ("location", "directions", "route")):
+            return True
+        return False
+
+    def _is_map_like_link(a) -> bool:
+        href = (a.get("href") or "").lower()
+        if not href:
+            return False
+        txt = clean(a.get_text(" ")).lower()
+        href_tokens = (
+            "google.com/maps",
+            "maps.google",
+            "maps.app.goo.gl",
+            "goo.gl/maps",
+            "mapbox.com",
+            "openstreetmap.org",
+            "bing.com/maps",
+            "waze.com",
+            "here.com",
+        )
+        if any(tok in href for tok in href_tokens):
+            return True
+        if re.search(r"\b(view larger map|get directions|open in maps?)\b", txt):
+            return True
+        return False
+
+    infographic_tokens = ("infographic", "chart", "graph", "diagram", "data visualization", "data viz")
     for img in root.find_all("img"):
-        alt = (img.get("alt") or "").lower()
-        title = (img.get("title") or "").lower()
-        if any(k in alt or k in title for k in ["infographic", "chart", "graph", "map", "diagram"]):
+        if _is_map_like_image(img):
+            has_maps = True
+            continue
+        alt, title, _cls, _blob = _img_parts(img)
+        if any(tok in alt or tok in title for tok in infographic_tokens):
             has_infographic = True
             break
+
     if not has_infographic:
         for img in root.find_all("img"):
-            cls = " ".join(img.get("class") or []).lower()
-            width = img.get("width")
-            height = img.get("height")
-            try:
-                w = int(width) if width else 0
-                h = int(height) if height else 0
-            except Exception:
-                w, h = 0, 0
-            if "wp-image" in cls or "attachment" in cls or w >= 200 or h >= 200:
+            if _is_map_like_image(img):
+                has_maps = True
+                continue
+            if _is_decorative_image(img):
+                continue
+            _alt, _title, cls, _blob = _img_parts(img)
+            w = _int_attr(img.get("width"))
+            h = _int_attr(img.get("height"))
+            if "wp-image" in cls or "attachment" in cls or w >= 240 or h >= 180:
                 has_visuals = True
                 break
-    if not has_infographic:
+
+    if not has_infographic and not has_visuals:
         for fig in root.find_all("figure"):
-            if fig.find("img"):
-                has_visuals = True
+            img = fig.find("img")
+            if not img:
+                continue
+            if _is_map_like_image(img):
+                has_maps = True
+                continue
+            if _is_decorative_image(img):
+                continue
+            has_visuals = True
+            break
+
+    for frame in root.find_all("iframe"):
+        if _is_map_like_iframe(frame):
+            has_maps = True
+            break
+
+    if not has_maps:
+        for a in root.find_all("a", href=True):
+            if _is_map_like_link(a):
+                has_maps = True
                 break
-    if has_infographic or has_visuals:
+
+    if has_infographic or has_visuals or has_maps:
         score += 1
-        signals.append("infographic/visuals")
+        if has_infographic:
+            signals.append("infographics/charts")
+        elif has_visuals:
+            signals.append("images/visuals")
+        if has_maps:
+            signals.append("maps/location")
 
     if score >= 3:
         label = "Good"
@@ -4684,16 +4802,90 @@ def _styling_layout_label(html: str) -> str:
     return label
 
 def _references_section_present(nodes: List[dict], html: str) -> str:
-    blob = headings_blob(nodes).lower()
-    if any(k in blob for k in ["references", "sources", "further reading", "bibliography"]):
-        return "Yes"
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        footers = soup.find_all(["footer", "section"])
-        for s in footers[-3:]:
-            txt = (s.get_text(" ") or "").lower()
-            if "references" in txt or "sources" in txt:
+    # Rule: a real references section must appear near the end of article
+    # and include source URLs listed under a references-like heading.
+    allowed_labels = {
+        "reference",
+        "references",
+        "source",
+        "sources",
+        "bibliography",
+        "further reading",
+        "works cited",
+        "citation",
+        "citations",
+        "references and sources",
+        "sources and references",
+    }
+    heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def is_reference_label(text: str) -> bool:
+        h = norm_header(text)
+        if not h:
+            return False
+        if h in allowed_labels:
+            return True
+        return bool(re.match(r"^(references?|sources?|citations?)(?:\s+(?:used|consulted))?$", h))
+
+    def is_near_end(idx: int, total: int) -> bool:
+        if total <= 0:
+            return False
+        # Last ~30% of headings, with a small-content safety floor.
+        return idx >= max(total - 3, int(total * 0.70))
+
+    def url_count_from_text(text: str) -> int:
+        if not text:
+            return 0
+        return len({u.rstrip(").,;:") for u in URL_RE.findall(text)})
+
+    def section_url_count_from_heading(tag) -> int:
+        urls = set()
+        for el in tag.find_all_next():
+            if el is tag:
+                continue
+            name = getattr(el, "name", None)
+            if name in heading_tags:
+                break
+            if name == "a":
+                href = clean(el.get("href") or "")
+                if href.startswith(("http://", "https://")):
+                    urls.add(href.rstrip(").,;:"))
+                elif href.startswith("//"):
+                    urls.add(("https:" + href).rstrip(").,;:"))
+            text_chunk = clean(el.get_text(" ")) if hasattr(el, "get_text") else ""
+            if text_chunk:
+                for u in URL_RE.findall(text_chunk):
+                    urls.add(u.rstrip(").,;:"))
+        return len(urls)
+
+    # Text-only fallback (manual/Jina): heading near end + URL-like text in section content.
+    flat = flatten(nodes or [])
+    if flat:
+        total = len(flat)
+        for idx, node in enumerate(flat):
+            if not is_reference_label(node.get("header", "")):
+                continue
+            if not is_near_end(idx, total):
+                continue
+            if url_count_from_text(node.get("content", "")) >= 1:
                 return "Yes"
+
+    if not html:
+        return "No"
+
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    headings = root.find_all(list(heading_tags))
+    total_headings = len(headings)
+
+    for idx, h in enumerate(headings):
+        if not is_reference_label(clean(h.get_text(" "))):
+            continue
+        if not is_near_end(idx, total_headings):
+            continue
+        if section_url_count_from_heading(h) >= 1:
+            return "Yes"
+
     return "No"
 
 def _data_points_count(text: str) -> int:
