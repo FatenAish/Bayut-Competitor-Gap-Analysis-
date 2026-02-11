@@ -4684,8 +4684,8 @@ def _styling_layout_label(html: str) -> str:
     return label
 
 def _references_section_present(nodes: List[dict], html: str) -> str:
-    # Keep this strict so generic headings like "Sources of demand"
-    # are not treated as a formal references section.
+    # Rule: a real references section must appear near the end of article
+    # and include source URLs listed under a references-like heading.
     allowed_labels = {
         "reference",
         "references",
@@ -4696,13 +4696,10 @@ def _references_section_present(nodes: List[dict], html: str) -> str:
         "works cited",
         "citation",
         "citations",
-        "reference links",
-        "source links",
-        "references sources",
-        "sources references",
         "references and sources",
         "sources and references",
     }
+    heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
     def is_reference_label(text: str) -> bool:
         h = norm_header(text)
@@ -4710,39 +4707,65 @@ def _references_section_present(nodes: List[dict], html: str) -> str:
             return False
         if h in allowed_labels:
             return True
-        # Accept compact variants like "References used".
-        if re.match(r"^(references?|sources?|citations?)(?:\s+(?:used|consulted))?$", h):
-            return True
-        return False
+        return bool(re.match(r"^(references?|sources?|citations?)(?:\s+(?:used|consulted))?$", h))
 
-    for x in flatten(nodes or []):
-        if is_reference_label(x.get("header", "")):
-            return "Yes"
+    def is_near_end(idx: int, total: int) -> bool:
+        if total <= 0:
+            return False
+        # Last ~30% of headings, with a small-content safety floor.
+        return idx >= max(total - 3, int(total * 0.70))
+
+    def url_count_from_text(text: str) -> int:
+        if not text:
+            return 0
+        return len({u.rstrip(").,;:") for u in URL_RE.findall(text)})
+
+    def section_url_count_from_heading(tag) -> int:
+        urls = set()
+        for el in tag.find_all_next():
+            if el is tag:
+                continue
+            name = getattr(el, "name", None)
+            if name in heading_tags:
+                break
+            if name == "a":
+                href = clean(el.get("href") or "")
+                if href.startswith(("http://", "https://")):
+                    urls.add(href.rstrip(").,;:"))
+                elif href.startswith("//"):
+                    urls.add(("https:" + href).rstrip(").,;:"))
+            text_chunk = clean(el.get_text(" ")) if hasattr(el, "get_text") else ""
+            if text_chunk:
+                for u in URL_RE.findall(text_chunk):
+                    urls.add(u.rstrip(").,;:"))
+        return len(urls)
+
+    # Text-only fallback (manual/Jina): heading near end + URL-like text in section content.
+    flat = flatten(nodes or [])
+    if flat:
+        total = len(flat)
+        for idx, node in enumerate(flat):
+            if not is_reference_label(node.get("header", "")):
+                continue
+            if not is_near_end(idx, total):
+                continue
+            if url_count_from_text(node.get("content", "")) >= 1:
+                return "Yes"
 
     if not html:
         return "No"
 
     soup = BeautifulSoup(html, "html.parser")
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    headings = root.find_all(list(heading_tags))
+    total_headings = len(headings)
 
-    # Raw HTML fallback in case heading extraction missed the section.
-    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
-        if is_reference_label(clean(h.get_text(" "))):
-            return "Yes"
-
-    # Final fallback: explicit footer/section label + list/link structure.
-    # This avoids broad body-text substring matches.
-    for s in soup.find_all(["footer", "section"])[-4:]:
-        heading_matches = any(
-            is_reference_label(clean(h.get_text(" ")))
-            for h in s.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], limit=4)
-        )
-        if heading_matches:
-            return "Yes"
-
-        txt = clean(s.get_text(" ")).lower()
-        if not re.match(r"^(references?|sources?|bibliography|works cited|citations?)\b", txt):
+    for idx, h in enumerate(headings):
+        if not is_reference_label(clean(h.get_text(" "))):
             continue
-        if len(s.find_all("a")) >= 2 or len(s.find_all("li")) >= 2:
+        if not is_near_end(idx, total_headings):
+            continue
+        if section_url_count_from_heading(h) >= 1:
             return "Yes"
 
     return "No"
