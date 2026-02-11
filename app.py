@@ -2200,13 +2200,30 @@ def _inline_numbered_from_html_list(html_text: str) -> str:
 def section_nodes(nodes: List[dict], levels=(2,3)) -> List[dict]:
     secs = []
     current_h2 = None
+    current_h2_is_faq = False
     for x in flatten(nodes):
         lvl = x["level"]
         h = strip_label(x.get("header",""))
+
+        # Keep parent context accurate so FAQ/questions do not leak
+        # under the previous non-FAQ H2 (e.g., "Conclusion").
+        if lvl == 2:
+            if not h or is_noise_header(h):
+                current_h2 = None
+                current_h2_is_faq = False
+            elif header_is_faq(h):
+                current_h2 = None
+                current_h2_is_faq = True
+            else:
+                current_h2 = h
+                current_h2_is_faq = False
+
+        # Ignore FAQ descendants for section gap comparison.
+        if lvl >= 3 and current_h2_is_faq:
+            continue
+
         if not h or is_noise_header(h) or header_is_faq(h):
             continue
-        if lvl == 2:
-            current_h2 = h
         if lvl in levels:
             c = clean(x.get("content",""))
             secs.append({"level": lvl, "header": h, "content": c, "parent_h2": current_h2})
