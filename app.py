@@ -979,17 +979,7 @@ NOISE_PATTERNS = [
     r"\bplease stand by\b", r"\bloading\b", r"\bjust a moment\b",
 ]
 
-GENERIC_SECTION_HEADERS = {
-    "introduction",
-    "overview",
-    "conclusion",
-    "in conclusion",
-    "final thought",
-    "final thoughts",
-    "closing thought",
-    "closing thoughts",
-    "closing remarks",
-}
+GENERIC_SECTION_HEADERS = {"introduction", "overview"}
 
 STOP = {
     "the","and","for","with","that","this","from","you","your","are","was","were","will","have","has","had",
