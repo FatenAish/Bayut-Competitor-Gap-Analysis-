@@ -4684,16 +4684,67 @@ def _styling_layout_label(html: str) -> str:
     return label
 
 def _references_section_present(nodes: List[dict], html: str) -> str:
-    blob = headings_blob(nodes).lower()
-    if any(k in blob for k in ["references", "sources", "further reading", "bibliography"]):
-        return "Yes"
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        footers = soup.find_all(["footer", "section"])
-        for s in footers[-3:]:
-            txt = (s.get_text(" ") or "").lower()
-            if "references" in txt or "sources" in txt:
-                return "Yes"
+    # Keep this strict so generic headings like "Sources of demand"
+    # are not treated as a formal references section.
+    allowed_labels = {
+        "reference",
+        "references",
+        "source",
+        "sources",
+        "bibliography",
+        "further reading",
+        "works cited",
+        "citation",
+        "citations",
+        "reference links",
+        "source links",
+        "references sources",
+        "sources references",
+        "references and sources",
+        "sources and references",
+    }
+
+    def is_reference_label(text: str) -> bool:
+        h = norm_header(text)
+        if not h:
+            return False
+        if h in allowed_labels:
+            return True
+        # Accept compact variants like "References used".
+        if re.match(r"^(references?|sources?|citations?)(?:\s+(?:used|consulted))?$", h):
+            return True
+        return False
+
+    for x in flatten(nodes or []):
+        if is_reference_label(x.get("header", "")):
+            return "Yes"
+
+    if not html:
+        return "No"
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Raw HTML fallback in case heading extraction missed the section.
+    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        if is_reference_label(clean(h.get_text(" "))):
+            return "Yes"
+
+    # Final fallback: explicit footer/section label + list/link structure.
+    # This avoids broad body-text substring matches.
+    for s in soup.find_all(["footer", "section"])[-4:]:
+        heading_matches = any(
+            is_reference_label(clean(h.get_text(" ")))
+            for h in s.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], limit=4)
+        )
+        if heading_matches:
+            return "Yes"
+
+        txt = clean(s.get_text(" ")).lower()
+        if not re.match(r"^(references?|sources?|bibliography|works cited|citations?)\b", txt):
+            continue
+        if len(s.find_all("a")) >= 2 or len(s.find_all("li")) >= 2:
+            return "Yes"
+
     return "No"
 
 def _data_points_count(text: str) -> int:
