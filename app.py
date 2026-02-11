@@ -979,7 +979,17 @@ NOISE_PATTERNS = [
     r"\bplease stand by\b", r"\bloading\b", r"\bjust a moment\b",
 ]
 
-GENERIC_SECTION_HEADERS = {"introduction", "overview"}
+GENERIC_SECTION_HEADERS = {
+    "introduction",
+    "overview",
+    "conclusion",
+    "in conclusion",
+    "final thought",
+    "final thoughts",
+    "closing thought",
+    "closing thoughts",
+    "closing remarks",
+}
 
 STOP = {
     "the","and","for","with","that","this","from","you","your","are","was","were","will","have","has","had",
@@ -2222,6 +2232,10 @@ def section_nodes(nodes: List[dict], levels=(2,3)) -> List[dict]:
         if lvl >= 3 and current_h2_is_faq:
             continue
 
+        # Treat question headings as FAQ-like fragments, not structural subtopics.
+        if lvl >= 3 and _looks_like_question(h):
+            continue
+
         if not h or is_noise_header(h) or header_is_faq(h):
             continue
         if lvl in levels:
@@ -2543,6 +2557,9 @@ def update_mode_rows_header_first(
         missing = []
         child_section_objs = [{"header": h} for h in bayut_children if clean(h)]
         for ch in comp_children:
+            # FAQ-like question headings are handled by FAQ logic, not section subtopics.
+            if _looks_like_question(ch):
+                continue
             if HIGH_PRECISION_MODE and _is_low_signal_subtopic(ch):
                 continue
             if _topic_is_covered(
