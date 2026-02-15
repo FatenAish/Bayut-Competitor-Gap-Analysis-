@@ -5339,6 +5339,21 @@ def render_table(df: pd.DataFrame, drop_internal_url: bool = True):
     html = df.to_html(index=False, escape=False, classes="data-table")
     st.markdown(html, unsafe_allow_html=True)
 
+def rules_modal_html(title: str, rule_lines: List[str], toggle_id: str) -> str:
+    rule_html = "".join(f"<li>{html_lib.escape(item)}</li>" for item in rule_lines)
+    return (
+        f"<input type='checkbox' id='{toggle_id}' class='rule-toggle'/>"
+        f"<label for='{toggle_id}' class='rule-trigger'>ⓘ</label>"
+        "<div class='rule-modal'>"
+        f"<label for='{toggle_id}' class='rule-backdrop'></label>"
+        "<div class='rule-card'>"
+        f"<h4>{html_lib.escape(title)}</h4>"
+        f"<label for='{toggle_id}' class='rule-close'>×</label>"
+        f"<ul>{rule_html}</ul>"
+        "</div>"
+        "</div>"
+    )
+
 ICON_LINK = """
 <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <path d="M10 13a5 5 0 0 1 0-7l1.6-1.6a5 5 0 0 1 7.1 7.1L17 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -5390,8 +5405,11 @@ def render_empty_state(title: str, body: str):
         unsafe_allow_html=True,
     )
 
-def section_header_pill(title: str):
-    st.markdown(f"<div class='section-title'>{html_lib.escape(title)}</div>", unsafe_allow_html=True)
+def section_header_pill(title: str, rules_html: str = ""):
+    st.markdown(
+        f"<div class='section-title'>{html_lib.escape(title)}{rules_html}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # =====================================================
@@ -5597,7 +5615,20 @@ if st.session_state.mode == "update":
             "Enter your URLs above and run the analysis to see competitor gap insights, SEO comparison, and content quality signals.",
         )
     else:
-        section_header_pill("Gaps Table")
+        gaps_rules = [
+            "Compare H2/H3 headings only (FAQ/noise headers excluded).",
+            "Competitor H2 with no Bayut match (similarity >= 0.73) becomes a missing section.",
+            "If matched, missing competitor H3 subtopics are listed.",
+            "Depth gap note appears when competitor coverage is >=30% longer (>=140 chars) and includes missing themes.",
+            "Orphan H3s (no H2 parent) are matched against Bayut H2/H3; unmatched ones are included.",
+            "FAQs: if competitor has a real FAQ and Bayut lacks questions, a FAQs row is added; rows deduped per source.",
+        ]
+        gaps_rules_html = rules_modal_html(
+            title="Gaps Table rules",
+            rule_lines=gaps_rules,
+            toggle_id="gaps-table-rules-toggle",
+        )
+        section_header_pill("Gaps Table", rules_html=gaps_rules_html)
         if st.session_state.update_df is None or st.session_state.update_df.empty:
             st.info("No gaps detected yet. Add more competitors or refine URLs.")
         else:
